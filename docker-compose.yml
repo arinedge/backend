@@ -1,0 +1,52 @@
+services:
+  api:
+    build: .
+    container_name: portal-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - api_logs:/app/logs
+    networks:
+      - portal-net
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  db:
+    image: postgres:16-alpine
+    container_name: portal-db
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-arinedge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-Arinedge2026}
+      POSTGRES_DB: ${POSTGRES_DB:-arinedge_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - portal-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-arinedge} -d ${POSTGRES_DB:-arinedge_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+  api_logs:
+
+networks:
+  portal-net:
+    driver: bridge
