@@ -34,11 +34,13 @@ class ForgotPasswordRequest(BaseModel):
 class ResetPasswordRequest(BaseModel):
     token: str
     new_password: str = Field(min_length=8, max_length=128)
-    confirm_password: str = Field(min_length=8, max_length=128)
+    confirm_password: str | None = Field(default=None, min_length=8, max_length=128)
 
     @field_validator("confirm_password")
     @classmethod
     def passwords_match(cls, v, info):
+        if v is None:
+            return v
         if v != info.data.get("new_password"):
             raise ValueError("Passwords do not match")
         return v

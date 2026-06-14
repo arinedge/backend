@@ -1,170 +1,251 @@
 # Portal Backend
 
-FastAPI authentication backend with JWT tokens, email verification via Zavu, and PostgreSQL.
+FastAPI backend for [arinedge.com](https://arinedge.com) — the core API gateway serving the Angular frontend, admin panel, and external clients. Handles authentication, broker integration, real-time market data (Upstox WebSocket), F&O analytics, news, graph intelligence, and service monitoring.
 
-## Prerequisites
+## Architecture
 
-- Python 3.12+
-- PostgreSQL (or use the Docker Compose setup)
-- Zavudev account (for emails)
-
-## Quick Start (Local)
-
-```bash
-# 1. Clone / enter project
-cd portal/backend
-
-# 2. Create virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# 3. Install dependencies
-pip install -r requirements.txt
-
-# 4. Configure environment
-cp .env.example .env
-# Edit .env — update DATABASE_URL, JWT_SECRET_KEY, ZAVUDEV_API_KEY
-
-# 5. Start the server
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-
-# 6. Seed test user (one time)
-python seed.py
-
-# 7. Open API docs
-open http://localhost:8000/docs
+```
+┌──────────────┐  ┌────────────────┐  ┌─────────────┐
+│  Angular SPA  │  │  Admin Panel   │  │  External   │
+│  :4200/3000   │  │  :4201         │  │  Clients    │
+└──────┬───────┘  └───────┬────────┘  └──────┬──────┘
+       │                  │                   │
+       └──────────────────┼───────────────────┘
+                          │
+               ┌──────────▼──────────┐
+               │   FastAPI Gateway   │
+               │  data.arinedge.com  │
+               │  :8000              │
+               └──────┬──────┬───────┘
+                      │      │
+            ┌─────────▼┐  ┌──▼────────┐
+            │PostgreSQL│  │   Redis   │
+            │:5432     │  │  :6379    │
+            └──────────┘  └───────────┘
 ```
 
-## Quick Start (Docker)
+- **Auth** — JWT-based signup/login, email verification via Zavu, password reset
+- **Market Data** — Live index/option ticks via Upstox WebSocket, cached in Redis, broadcast via internal WebSocket
+- **F&O** — Option chain, expiry management, Greeks, GEX, max pain via Upstox REST API
+- **Broker Management** — Multi-broker CRUD (Upstox), token management
+- **News** — Paginated news articles with source/author/date filters from `market_news` table
+- **Graph Intelligence** — Entity resolution, canonical entities, relationships, events, metrics (NetworkX + LLM)
+- **Waitlist** — Referral-based waitlist with queue positions and bonus system
+- **Service Monitor** — Admin dashboard for tracking all microservice health, run history, table metadata
+- **Sitemap** — Dynamic XML sitemap generation for SEO
 
-```bash
-# 1. Configure
-cp .env.example .env
-# Edit .env with your credentials
+## Tech Stack
 
-# 2. Build and start (API + PostgreSQL)
-docker compose up -d --build
+- **Framework:** FastAPI + Uvicorn
+- **Database:** PostgreSQL 16 (SQLAlchemy ORM + Alembic migrations)
+- **Cache:** Redis 7 (market data, session caching)
+- **Data Sources:** Upstox REST API + WebSocket (live market), yfinance (historical)
+- **LLM:** Groq (Llama 3.3 70B) + OpenRouter (DeepSeek) for graph extraction pipeline
+- **Email:** Zavu API
+- **Infrastructure:** Docker, single-container deployment behind nginx
 
-# 3. Seed test user
-docker compose exec api python seed.py
+## Data Sources
 
-# 4. Verify
-curl http://localhost:8000/health
-```
+| Source | Data | Access |
+|---|---|---|
+| Upstox REST API | F&O symbols, expiries, option chains, Greeks, GEX, max pain, live indices | Broker access token (REST + WS) |
+| Upstox WebSocket | Real-time index/option ticks (NSE_FO, BSE_FO, NSE_INDEX) | Broker access token |
+| PostgreSQL | Cached market data, user profiles, news, entities, waitlist, service runs | Direct ORM |
+| Redis | Market data snapshots, uptime, cache layer | Internal |
+| yfinance | Historical stock data (fallsback when Upstox unavailable) | Public API |
+| Groq / OpenRouter | LLM extraction pipeline for graph intelligence | API keys |
 
-## Environment Variables (`.env`)
+## Endpoints
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection string | postgresql://... |
-| `JWT_SECRET_KEY` | JWT signing secret (min 32 chars) | change-me |
-| `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` | Token lifetime (minutes) | 30 |
-| `ZAVUDEV_API_KEY` | Zavudev API key for emails | — |
-| `FRONTEND_URL` | Angular app URL (for email links) | http://localhost:4200 |
-| `DEBUG` | Enable docs and debug logging | false |
+All endpoints under `https://data.arinedge.com/api/v1/`
 
-## API Endpoints
-
-### Public (no token)
-
-| Method | Endpoint | Body |
-|--------|----------|------|
-| `POST` | `/api/v1/auth/signup` | `{username, full_name, email, password, confirm_password, mobile?}` |
-| `POST` | `/api/v1/auth/login` | `{email, password}` |
-| `POST` | `/api/v1/auth/verify-email` | `{token}` |
-| `POST` | `/api/v1/auth/resend-verification?email=` | — |
-| `POST` | `/api/v1/auth/forgot-password` | `{email}` |
-| `POST` | `/api/v1/auth/reset-password` | `{token, new_password, confirm_password}` |
-| `GET` | `/health` | — |
-
-### Protected (Bearer token)
+### Authentication (`/auth`)
 
 | Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/api/v1/users/me` | Get current user profile |
-| `PUT` | `/api/v1/users/me` | Update username, full_name, mobile |
-| `DELETE` | `/api/v1/users/me` | Deactivate account |
+|---|---|---|
+| `POST` | `/auth/signup` | Create account |
+| `POST` | `/auth/login` | Login, returns JWT |
+| `POST` | `/auth/verify-email` | Verify email with token |
+| `POST` | `/auth/resend-verification` | Resend verification email |
+| `POST` | `/auth/forgot-password` | Request password reset |
+| `POST` | `/auth/reset-password` | Reset password with token |
 
-## Auth Flow
+### Users (`/users`)
 
-1. Client calls `POST /signup` — user created, verification email sent via Zavu
-2. User clicks verification link → Angular frontend calls `POST /verify-email` with token
-3. User logs in via `POST /login` → receives JWT `{access_token, token_type: "bearer"}`
-4. Angular stores token, sends it as `Authorization: Bearer <token>` header
-5. Backend validates token via `get_current_user` dependency
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/users/me` | Current user profile |
+| `PUT` | `/users/me` | Update profile |
+| `DELETE` | `/users/me` | Deactivate account |
+
+### Brokers (`/brokers`)
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/brokers/` | List user's brokers |
+| `POST` | `/brokers/` | Add broker account |
+| `GET` | `/brokers/{id}` | Get broker details |
+| `PUT` | `/brokers/{id}` | Update broker |
+| `DELETE` | `/brokers/{id}` | Remove broker |
+
+### Market Data (`/market`)
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/market/data` | Latest market snapshot (indices, status) |
+| `WS` | `/market/ws` | Real-time market data WebSocket |
+
+### F&O (`/fno`)
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/fno/symbols` | List F&O symbols (searchable, filterable) |
+| `GET` | `/fno/symbols/{symbol}/expiries` | Available expiries for a symbol |
+| `GET` | `/fno/option-chain` | Full option chain (strikes, OI, volume, IV, Greeks) |
+| `GET` | `/fno/option-chain/geeks` | Greeks-only view for all strikes |
+| `GET` | `/fno/option-chain/gex` | GEX profile across strikes |
+| `GET` | `/fno/option-chain/max-pain` | Max pain strike calculation |
+
+### News (`/news`)
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/news` | Paginated news articles with filters |
+| `GET` | `/news/filters` | Available filter options (sources, authors, dates) |
+| `GET` | `/news/{id}` | Single article detail |
+| `GET` | `/news/{id}/extractions` | LLM extractions for an article |
+
+### Graph Intelligence (`/graph`)
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/graph/entities` | Search canonical entities |
+| `GET` | `/graph/entities/{id}` | Entity detail with relationships |
+| `PUT` | `/graph/entities/{id}` | Update entity metadata |
+| `DELETE` | `/graph/entities/{id}` | Remove entity |
+| `GET` | `/graph/entities/{id}/relationships` | Entity's relationships |
+| `GET` | `/graph/entities/{id}/events` | Entity's event timeline |
+| `POST` | `/graph/entities/merge` | Merge duplicate entities |
+| `GET` | `/graph/relationships` | List relationships (filterable) |
+| `PUT` | `/graph/relationships/{id}` | Override relationship type |
+| `DELETE` | `/graph/relationships/{id}` | Remove relationship |
+| `GET` | `/graph/events` | List graph events |
+| `GET` | `/graph/metrics` | Graph stats (nodes, edges, types, sectors) |
+| `GET` | `/graph/data` | Full graph data dump for visualization |
+
+### Waitlist (`/waitlist`)
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/waitlist` | Join waitlist (with referral) |
+| `GET` | `/waitlist/stats/{email}` | Referral stats and queue position |
+
+### Admin Monitor (`/admin`)
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/admin/services` | All registered services + latest run |
+| `GET` | `/admin/services/{name}` | Service detail |
+| `GET` | `/admin/services/{name}/runs` | Run history for a service |
+| `POST` | `/admin/services/{name}/runs` | Register a new run |
+| `POST` | `/admin/services` | Register a new service |
+| `PUT` | `/admin/services/{name}` | Update service config |
+| `DELETE` | `/admin/services/{name}` | Unregister service |
+| `GET` | `/admin/tables` | Table metadata (row counts, sizes) |
+
+### Sitemap
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/sitemap.xml` | Dynamic XML sitemap |
+
+### System
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/health` | Health check |
+
+## Background Tasks
+
+| Task | Description | Schedule |
+|---|---|---|
+| Market Data Poller | Checks market open/close, starts/stops Upstox WebSocket accordingly | Every 60s |
+| Graph Pipeline | LLM entity extraction pipeline, processes unprocessed articles via Groq/OpenRouter | Every 120s |
+
+## Database (45+ tables)
+
+Major model groups:
+- **Auth:** `users`, `email_verification_tokens`, `password_reset_tokens`
+- **Market Data:** `stock_indices`, `index_data`, `option_chain_cache`
+- **F&O:** `fno_symbols`, `fno_expiries`
+- **News:** `market_news`, `news_extraction`
+- **Graph:** `canonical_entities`, `entity_aliases`, `relationships`, `graph_events`, `graph_metrics`
+- **Brokers:** `brokers`
+- **Monitor:** `service_registry`, `service_runs`, `table_metadata`
+- **Waitlist:** `waitlist_entries`
+- **Backfill:** `nse_securities`, `bulk_price_sync_log`
+
+## Scheduled Jobs
+
+Market data poller checks market status every 60s. Graph pipeline runs every 120s. All data syncs (market data sync, bulk price sync) run from the research/services/market_data_sync service (separate container).
+
+## Key Design Decisions
+
+- **Upstox WebSocket lifecycle** — auto-started on market open, stopped on close; handles reconnect gracefully
+- **Redis cache** — market data snapshots cached with 60s TTL; enables fast recovery on restart
+- **Option chain** — cached in DB after fetch; Upstox API is polled only on expiry or explicit refresh
+- **Graph pipeline** — processes news extractions from `research/services/kiyannet`, resolves entities canonically, builds relationship graph
+- **Correlation IDs** — every request gets a `X-Correlation-ID` header; logged to JSON for debugging
+- **Global exception handler** — catches unhandled errors, returns correlation ID for debugging
+
+## Deployment
+
+```bash
+# Deploy with main docker-compose (from project root)
+docker compose up -d --build
+
+# The API runs as: arinedge_backend
+# Port: 8000
+# Auto-restarts via: restart: unless-stopped
+```
 
 ## Project Structure
 
 ```
 backend/
 ├── app/
-│   ├── main.py                 # FastAPI entry point, CORS, middleware
+│   ├── main.py                 # FastAPI entry, lifespan, CORS, middleware
 │   ├── config.py               # Settings from .env (pydantic-settings)
 │   ├── database.py             # SQLAlchemy engine, session, Base
-│   ├── models/
-│   │   └── user.py             # User model
-│   ├── schemas/
-│   │   └── user.py             # Pydantic request/response schemas
-│   ├── api/v1/
-│   │   ├── auth.py             # Auth endpoints (public)
-│   │   └── users.py            # User endpoints (protected)
-│   ├── services/
-│   │   ├── auth.py             # Auth business logic
-│   │   └── email.py            # Zavu email service
-│   ├── dependencies/
-│   │   └── auth.py             # JWT dependency injection
-│   └── utils/
-│       ├── security.py         # bcrypt, JWT, public_id generation
-│       └── logger.py           # Structured JSON logging
-├── alembic/                    # Database migrations
-├── logs/                       # Log files (gitignored)
-├── seed.py                     # Seed test user
-├── test_zavu.py                # Test Zavu connectivity
+│   ├── api/v1/                 # Route handlers
+│   │   ├── auth.py             # Auth endpoints
+│   │   ├── users.py            # User CRUD
+│   │   ├── brokers.py          # Broker management
+│   │   ├── market_data.py      # Market data + WebSocket
+│   │   ├── fno.py              # F&O option chain, Greeks, GEX
+│   │   ├── news.py             # News articles
+│   │   ├── graph.py            # Graph intelligence
+│   │   ├── waitlist.py         # Referral waitlist
+│   │   ├── admin_monitor.py    # Service monitoring dashboard
+│   │   └── sitemap.py          # Dynamic sitemap
+│   ├── models/                 # SQLAlchemy models (all 45+ tables)
+│   ├── schemas/                # Pydantic request/response schemas
+│   ├── services/               # Business logic
+│   │   ├── market_data_service.py
+│   │   ├── broker_service.py
+│   │   ├── fno_service.py
+│   │   ├── news_service.py
+│   │   ├── graph_service.py
+│   │   ├── upstox.py           # Upstox REST client
+│   │   ├── upstox_ws.py        # Upstox WebSocket client
+│   │   └── ws_manager.py       # Internal WS broadcast
+│   ├── components/graph/       # Graph pipeline components
+│   ├── dependencies/           # JWT deps, auth guards
+│   └── utils/                  # Security, logging, Redis cache
+├── alembic/                    # DB migrations
+├── logs/                       # JSON + plain log files
+├── seed.py                     # Test user seed
 ├── Dockerfile
-├── docker-compose.yml
 ├── requirements.txt
 └── .env.example
-```
-
-## Logging
-
-Logs are written to `logs/app.log` (plain text) and `logs/app.json.log` (JSON, filterable).
-
-Filter examples:
-```bash
-# All errors
-grep '"level": "ERROR"' logs/app.json.log
-
-# Emails only
-grep '"module": "email"' logs/app.json.log
-
-# By correlation ID
-grep '"correlation_id": "abc123"' logs/app.json.log
-```
-
-## Database Migrations
-
-```bash
-# Generate migration after model changes
-alembic revision --autogenerate -m "description"
-
-# Apply migrations
-alembic upgrade head
-
-# Rollback
-alembic downgrade -1
-```
-
-## Troubleshooting
-
-**Emails not sending:**
-```bash
-python test_zavu.py        # Test Zavu connectivity
-tail -f logs/app.json.log  # Check email logs for errors
-```
-
-**bcrypt / passlib error:**
-```bash
-pip uninstall passlib -y
-pip install bcrypt>=4.0.0
 ```
