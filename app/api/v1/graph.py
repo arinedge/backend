@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.dependencies.auth import get_current_admin_user
 from app.services.graph_service import GraphService
 from app.components.graph.pipeline import GraphPipeline
 from app.models.graph import CanonicalEntity, Relationship
@@ -141,25 +142,25 @@ def get_influence_path(source_id: int = Query(...), target_id: int = Query(...),
     return path
 
 
-@router.post("/pipeline/run-incremental")
+@router.post("/pipeline/run-incremental", dependencies=[Depends(get_current_admin_user)])
 def run_incremental_pipeline():
     pipeline = GraphPipeline()
     return pipeline.run_incremental()
 
 
-@router.post("/pipeline/run-full")
+@router.post("/pipeline/run-full", dependencies=[Depends(get_current_admin_user)])
 def run_full_pipeline():
     pipeline = GraphPipeline()
     return pipeline.run_full()
 
 
-@router.post("/pipeline/reset-cursors")
+@router.post("/pipeline/reset-cursors", dependencies=[Depends(get_current_admin_user)])
 def reset_pipeline_cursors():
     pipeline = GraphPipeline()
     return pipeline.reset_cursors()
 
 
-@router.post("/pipeline/reprocess/{extraction_id}")
+@router.post("/pipeline/reprocess/{extraction_id}", dependencies=[Depends(get_current_admin_user)])
 def reprocess_extraction(extraction_id: int):
     pipeline = GraphPipeline()
     return pipeline.run_single_extraction(extraction_id)
@@ -171,13 +172,13 @@ def get_pipeline_status():
     return pipeline.get_pipeline_status()
 
 
-@router.post("/admin/merge-entities")
+@router.post("/admin/merge-entities", dependencies=[Depends(get_current_admin_user)])
 def merge_entities(request: EntityMergeRequest, db: Session = Depends(get_db)):
     service = GraphService(db)
     return service.merge_entities(request)
 
 
-@router.put("/admin/relationships/{relationship_id}", response_model=RelationshipOut)
+@router.put("/admin/relationships/{relationship_id}", response_model=RelationshipOut, dependencies=[Depends(get_current_admin_user)])
 def override_relationship(relationship_id: int, request: RelationshipOverrideRequest, db: Session = Depends(get_db)):
     service = GraphService(db)
     request.relationship_id = relationship_id

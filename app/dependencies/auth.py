@@ -59,10 +59,6 @@ async def get_current_user(
         logger.warning("JWT valid but user not found: %s", user_uuid)
         raise credentials_exception
 
-    if not user.is_logged_in:
-        logger.warning("Token used after logout for user id=%s", user_uuid)
-        raise credentials_exception
-
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -82,7 +78,8 @@ async def get_current_user_optional(
     try:
         payload = decode_access_token(credentials.credentials)
         user_id: str = payload.get("sub")
-        if not user_id:
+        token_type: str = payload.get("type")
+        if not user_id or token_type != "access":
             return None
         user = db.query(User).filter(User.id == uuid.UUID(user_id)).first()
         if user and user.is_active:
@@ -99,5 +96,16 @@ async def get_current_active_verified_user(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Email not verified",
+        )
+    return current_user
+
+
+async def get_current_admin_user(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required",
         )
     return current_user

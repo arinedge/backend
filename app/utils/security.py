@@ -1,3 +1,4 @@
+import hashlib
 import secrets
 import string
 import uuid
@@ -21,16 +22,33 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     )
 
 
-def create_access_token(subject: str | uuid.UUID) -> str:
+def create_access_token(subject: str | uuid.UUID, role: str = "user") -> str:
     expire = datetime.now(timezone.utc) + timedelta(
         minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES
     )
-    to_encode = {"sub": str(subject), "exp": expire, "type": "access"}
+    jti = uuid.uuid4().hex
+    now = datetime.now(timezone.utc)
+    to_encode = {
+        "sub": str(subject),
+        "exp": expire,
+        "iat": now,
+        "type": "access",
+        "jti": jti,
+        "role": role,
+    }
     return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
 def decode_access_token(token: str) -> dict:
     return jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+
+
+def create_refresh_token() -> str:
+    return secrets.token_urlsafe(64)
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def create_verification_token() -> str:
@@ -39,6 +57,11 @@ def create_verification_token() -> str:
 
 def get_token_expiry(hours: int = 24) -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=hours)
+
+
+def get_refresh_token_expiry() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+
 
 def generate_public_id() -> str:
     letters = "".join(secrets.choice(string.ascii_uppercase) for _ in range(4))

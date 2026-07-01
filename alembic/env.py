@@ -5,9 +5,10 @@ from alembic import context
 
 from app.config import get_settings
 from app.database import Base
-from app.models import User  # noqa: F401 - ensure models are loaded
+from app.models import User, UserSession, LoginAuditEvent  # noqa: F401 - ensure models are loaded
 from app.models.market_data import MarketData  # noqa: F401
 from app.models.fno import FnoSymbol, FnoExpiry, FnoInstrument  # noqa: F401
+from app.models.stock_info import StockInfo  # noqa: F401
 
 settings = get_settings()
 

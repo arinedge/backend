@@ -1,18 +1,15 @@
+import math
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, desc
+from sqlalchemy import func, desc, text
 from sqlalchemy.orm import Session
 
 from app.models.stock_info import StockInfo
-from app.services.stock_compare_service import StockCompareService
+from app.services.stock_compare_service import StockCompareService, _safe_float
 from app.utils.logger import get_logger
-from app.utils.redis_cache import cache_get, cache_set
 
 logger = get_logger(__name__)
-
-FINANCIALS_CACHE_TTL = 86400  # 24 hours
-LIVE_CACHE_TTL = 30  # 30 seconds
 
 
 def _slugify(symbol: str) -> str:
@@ -32,12 +29,54 @@ class StockService:
     def _get_compare_service(self) -> StockCompareService:
         return StockCompareService(self.db)
 
-    def get_stock_financials(self, symbol: str) -> dict[str, Any] | None:
-        cache_key = f"stock:financials:{symbol.lower()}"
-        cached = cache_get(cache_key)
-        if cached:
-            return cached
+    def _fetch_statement_snapshot(self, ticker: str, statement_type: str) -> tuple[dict[str, Any], str | None]:
+        rows = self.db.execute(text("""
+            WITH latest_period AS (
+                SELECT MAX(fiscal_date) AS fiscal_date
+                FROM stock_financials
+                WHERE lower(ticker) = lower(:ticker)
+                  AND statement_type = :statement_type
+            )
+            SELECT fiscal_date, line_item, value
+            FROM stock_financials
+            WHERE lower(ticker) = lower(:ticker)
+              AND statement_type = :statement_type
+              AND fiscal_date = (SELECT fiscal_date FROM latest_period)
+        """), {"ticker": ticker, "statement_type": statement_type})
 
+        payload: dict[str, Any] = {}
+        fiscal_date = None
+        for row in rows:
+            fiscal_date = row.fiscal_date
+            numeric = _safe_float(row.value)
+            if numeric is not None:
+                payload[row.line_item] = numeric
+        return payload, (fiscal_date.isoformat() if fiscal_date else None)
+
+    def _fetch_statement_history(self, ticker: str, statement_type: str, limit: int = 4) -> list[dict[str, Any]]:
+        rows = self.db.execute(text("""
+            SELECT fiscal_date, line_item, value
+            FROM stock_financials
+            WHERE lower(ticker) = lower(:ticker)
+              AND statement_type = :statement_type
+            ORDER BY fiscal_date DESC, line_item
+        """), {"ticker": ticker, "statement_type": statement_type})
+
+        periods: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            fiscal_date = row.fiscal_date.isoformat() if row.fiscal_date else None
+            if not fiscal_date:
+                continue
+            if fiscal_date not in periods:
+                if len(periods) >= limit:
+                    continue
+                periods[fiscal_date] = {"fiscal_date": fiscal_date, "values": {}}
+            numeric = _safe_float(row.value)
+            if numeric is not None:
+                periods[fiscal_date]["values"][row.line_item] = numeric
+        return list(periods.values())
+
+    def get_stock_financials(self, symbol: str) -> dict[str, Any] | None:
         ticker = f"{symbol.upper()}.NS"
         info = self.db.query(StockInfo).filter(
             func.lower(StockInfo.ticker) == ticker.lower()
@@ -48,9 +87,15 @@ class StockService:
 
         cs = self._get_compare_service()
         fin = cs._fetch_financials_eav(ticker) or {}
-        income = cs._pivot_from_financials(fin, "income_statement", StockCompareService.FINANCIAL_LINE_ITEMS)
-        cashflow = cs._pivot_from_financials(fin, "cashflow", StockCompareService.CASH_FLOW_ITEMS)
-        bs = fin.get("balance_sheet", {})
+        income, annual_income_date = self._fetch_statement_snapshot(ticker, "income_statement")
+        cashflow, annual_cashflow_date = self._fetch_statement_snapshot(ticker, "cashflow")
+        balance_sheet, annual_balance_date = self._fetch_statement_snapshot(ticker, "balance_sheet")
+        quarterly_income_history = self._fetch_statement_history(ticker, "quarterly_income", limit=4)
+        quarterly_cashflow_history = self._fetch_statement_history(ticker, "quarterly_cashflow", limit=4)
+        quarterly_balance_history = self._fetch_statement_history(ticker, "quarterly_balance_sheet", limit=4)
+        latest_quarterly_income, latest_quarterly_income_date = self._fetch_statement_snapshot(ticker, "quarterly_income")
+        latest_quarterly_cashflow, latest_quarterly_cashflow_date = self._fetch_statement_snapshot(ticker, "quarterly_cashflow")
+        latest_quarterly_balance, latest_quarterly_balance_date = self._fetch_statement_snapshot(ticker, "quarterly_balance_sheet")
 
         result = {
             "symbol": _clean_ticker(info.ticker) or symbol.upper(),
@@ -58,24 +103,38 @@ class StockService:
             "sector": info.sector,
             "industry": info.industry,
             "description": info.description,
-            "market_cap": info.market_cap,
+            "market_cap": _safe_float(info.market_cap),
             "ratios": {
-                "trailing_pe": info.trailing_pe,
-                "forward_pe": info.forward_pe,
-                "price_to_book": info.price_to_book,
-                "dividend_yield": info.dividend_yield,
-                "roe": info.roe,
-                "roa": info.roa,
-                "profit_margins": info.profit_margins,
-                "revenue_growth": info.revenue_growth,
-                "earnings_growth": info.earnings_growth,
-                "eps": info.eps,
-                "forward_eps": info.forward_eps,
+                "trailing_pe": _safe_float(info.trailing_pe),
+                "forward_pe": _safe_float(info.forward_pe),
+                "price_to_book": _safe_float(info.price_to_book),
+                "dividend_yield": _safe_float(info.dividend_yield),
+                "roe": _safe_float(info.roe),
+                "roa": _safe_float(info.roa),
+                "profit_margins": _safe_float(info.profit_margins),
+                "revenue_growth": _safe_float(info.revenue_growth),
+                "earnings_growth": _safe_float(info.earnings_growth),
+                "eps": _safe_float(info.eps),
+                "forward_eps": _safe_float(info.forward_eps),
             },
             "financials": income or {},
             "cash_flow": cashflow or {},
-            "balance_sheet": {
-                k: v for k, v in bs.items() if isinstance(v, (int, float))
+            "balance_sheet": balance_sheet or {},
+            "quarterly_financials": latest_quarterly_income,
+            "quarterly_cash_flow": latest_quarterly_cashflow,
+            "quarterly_balance_sheet": latest_quarterly_balance,
+            "quarterly_history": {
+                "income_statement": quarterly_income_history,
+                "cashflow": quarterly_cashflow_history,
+                "balance_sheet": quarterly_balance_history,
+            },
+            "statement_dates": {
+                "annual_income_statement": annual_income_date,
+                "annual_cashflow": annual_cashflow_date,
+                "annual_balance_sheet": annual_balance_date,
+                "quarterly_income_statement": latest_quarterly_income_date,
+                "quarterly_cashflow": latest_quarterly_cashflow_date,
+                "quarterly_balance_sheet": latest_quarterly_balance_date,
             },
             "fetched_at": (
                 info.fetched_at.replace(tzinfo=timezone.utc).isoformat()
@@ -83,15 +142,9 @@ class StockService:
             ),
         }
 
-        cache_set(cache_key, result, FINANCIALS_CACHE_TTL)
         return result
 
     def get_stock_live(self, symbol: str) -> dict[str, Any] | None:
-        cache_key = f"stock:live:{symbol.lower()}"
-        cached = cache_get(cache_key)
-        if cached:
-            return cached
-
         ticker = f"{symbol.upper()}.NS"
         info = self.db.query(StockInfo).filter(
             func.lower(StockInfo.ticker) == ticker.lower()
@@ -126,6 +179,20 @@ class StockService:
                         for s in (metrics.get("top_put_oi") or [])[:5]
                     ],
                 }
+        if not fno_data:
+            sm_row = self.db.execute(
+                text("""
+                    SELECT close_price AS spot_price, volume, change_pct, rsi_14 AS rsi,
+                           sma_20 AS moving_average_20, sma_50 AS moving_average_50
+                    FROM stock_daily_metrics
+                    WHERE symbol = :sym
+                    ORDER BY trade_date DESC
+                    LIMIT 1
+                """),
+                {"sym": symbol},
+            ).fetchone()
+            if sm_row:
+                fno_data = dict(sm_row._mapping)
 
         result = {
             "symbol": _clean_ticker(info.ticker) or symbol.upper(),
@@ -139,14 +206,15 @@ class StockService:
             "fno": fno_data,
         }
 
-        cache_set(cache_key, result, LIVE_CACHE_TTL)
         return result
 
     def get_stocks_by_sector(self) -> dict[str, list[dict[str, Any]]]:
-        rows = self.db.query(StockInfo).filter(
-            StockInfo.sector.isnot(None),
-            StockInfo.sector != "",
-        ).order_by(StockInfo.sector, StockInfo.company_name).all()
+        rows = self.db.execute(text("""
+            SELECT symbol, company_name, sector, industry, market_cap
+            FROM stock_info
+            WHERE sector IS NOT NULL AND sector != ''
+            ORDER BY sector, company_name
+        """))
 
         sectors: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
@@ -154,19 +222,21 @@ class StockService:
             if sec not in sectors:
                 sectors[sec] = []
             sectors[sec].append({
-                "symbol": _clean_ticker(row.ticker) or "",
+                "symbol": row.symbol,
                 "company_name": row.company_name,
-                "slug": _slugify(_clean_ticker(row.ticker) or ""),
+                "slug": _slugify(row.symbol or ""),
                 "market_cap": row.market_cap,
                 "industry": row.industry,
             })
         return {"sectors": sectors}
 
     def get_stocks_by_industry(self) -> dict[str, list[dict[str, Any]]]:
-        rows = self.db.query(StockInfo).filter(
-            StockInfo.industry.isnot(None),
-            StockInfo.industry != "",
-        ).order_by(StockInfo.industry, StockInfo.company_name).all()
+        rows = self.db.execute(text("""
+            SELECT symbol, company_name, sector, industry, market_cap
+            FROM stock_info
+            WHERE industry IS NOT NULL AND industry != ''
+            ORDER BY industry, company_name
+        """))
 
         industries: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
@@ -174,10 +244,28 @@ class StockService:
             if ind not in industries:
                 industries[ind] = []
             industries[ind].append({
-                "symbol": _clean_ticker(row.ticker) or "",
+                "symbol": row.symbol,
                 "company_name": row.company_name,
-                "slug": _slugify(_clean_ticker(row.ticker) or ""),
+                "slug": _slugify(row.symbol or ""),
                 "market_cap": row.market_cap,
                 "sector": row.sector,
             })
         return {"industries": industries}
+
+    def get_stock_pe_history(self, symbol: str, limit: int = 12) -> list[dict[str, Any]]:
+        rows = self.db.execute(text("""
+            SELECT report_date, symbol, pe, adjusted_pe
+            FROM nse_pe_ratios
+            WHERE lower(symbol) = lower(:symbol)
+            ORDER BY report_date DESC
+            LIMIT :limit
+        """), {"symbol": symbol.upper(), "limit": limit})
+        return [
+            {
+                "report_date": row.report_date.isoformat() if row.report_date else None,
+                "symbol": row.symbol,
+                "pe": _safe_float(row.pe),
+                "adjusted_pe": _safe_float(row.adjusted_pe),
+            }
+            for row in rows
+        ]

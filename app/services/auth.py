@@ -1,17 +1,25 @@
+import hashlib
 import traceback
 import uuid
 from datetime import datetime, timezone
 
+from fastapi import Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.user import User
+from app.models.user_session import UserSession
+from app.models.login_audit import LoginAuditEvent
 from app.schemas.user import UserCreate
 from app.utils.security import (
     hash_password,
     verify_password,
+    create_access_token,
+    create_refresh_token,
+    hash_token,
     create_verification_token,
     get_token_expiry,
+    get_refresh_token_expiry,
     generate_public_id,
 )
 from app.utils.logger import get_logger
@@ -20,6 +28,73 @@ from app.config import get_settings
 
 settings = get_settings()
 logger = get_logger(__name__)
+
+
+def _hash_ip(ip: str | None) -> str | None:
+    if not ip:
+        return None
+    return hashlib.sha256(ip.encode("utf-8")).hexdigest()[:16]
+
+
+def _get_client_ip(request: Request | None) -> str | None:
+    if not request:
+        return None
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else None
+
+
+def _log_audit(
+    db: Session,
+    event_type: str,
+    success: bool,
+    user_id: uuid.UUID | None = None,
+    email: str | None = None,
+    reason: str | None = None,
+    request: Request | None = None,
+):
+    try:
+        ip = _get_client_ip(request)
+        ip_hash = _hash_ip(ip) if ip else None
+        user_agent = request.headers.get("User-Agent") if request else None
+        event = LoginAuditEvent(
+            user_id=user_id,
+            email=email,
+            event_type=event_type,
+            ip_hash=ip_hash,
+            user_agent=user_agent,
+            success=success,
+            reason=reason,
+        )
+        db.add(event)
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.error("Failed to log audit event:\n%s", traceback.format_exc())
+
+
+def _set_refresh_cookie(response, refresh_token: str):
+    max_age = settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400
+    response.set_cookie(
+        key=settings.AUTH_REFRESH_COOKIE_NAME,
+        value=refresh_token,
+        max_age=max_age,
+        httponly=True,
+        secure=settings.AUTH_COOKIE_SECURE,
+        samesite=settings.AUTH_COOKIE_SAMESITE,
+        path="/api/v1/auth",
+    )
+
+
+def _clear_refresh_cookie(response):
+    response.delete_cookie(
+        key=settings.AUTH_REFRESH_COOKIE_NAME,
+        path="/api/v1/auth",
+        httponly=True,
+        secure=settings.AUTH_COOKIE_SECURE,
+        samesite=settings.AUTH_COOKIE_SAMESITE,
+    )
 
 
 class AuthService:
@@ -86,7 +161,10 @@ class AuthService:
         return user
 
     @staticmethod
-    def authenticate_user(db: Session, email: str, password: str) -> User | None:
+    def authenticate_user(
+        db: Session, email: str, password: str, request: Request | None = None
+    ) -> tuple[User, str, str] | None:
+        """Returns (user, access_token, refresh_token) on success, None on failure."""
         try:
             user = db.execute(
                 select(User).where(User.email == email)
@@ -97,23 +175,176 @@ class AuthService:
 
         if not user:
             logger.warning("Login failed — email not found: %s", email)
+            _log_audit(db, "login_failed", False, email=email, reason="email_not_found", request=request)
             return None
         if not verify_password(password, user.hashed_password):
             logger.warning("Login failed — wrong password for user id=%s", user.id)
+            _log_audit(db, "login_failed", False, user.id, email, "wrong_password", request)
             return None
 
+        refresh_token = create_refresh_token()
+        refresh_token_hash = hash_token(refresh_token)
+
         try:
+            session = UserSession(
+                user_id=user.id,
+                refresh_token_hash=refresh_token_hash,
+                expires_at=get_refresh_token_expiry(),
+            )
+            if request:
+                ip = _get_client_ip(request)
+                session.ip_hash = _hash_ip(ip) if ip else None
+                session.user_agent = request.headers.get("User-Agent")
+
+            db.add(session)
+
             user.is_logged_in = True
             user.last_login_at = datetime.now(timezone.utc)
             user.login_count = (user.login_count or 0) + 1
             db.commit()
         except Exception:
             db.rollback()
-            logger.error("DB error updating login state:\n%s", traceback.format_exc())
+            logger.error("DB error creating session:\n%s", traceback.format_exc())
             raise
 
+        access_token = create_access_token(user.id, user.role)
+        _log_audit(db, "login_success", True, user.id, email, request=request)
+
         logger.info("User authenticated id=%s email=%s", user.id, user.email)
-        return user
+        return user, access_token, refresh_token
+
+    @staticmethod
+    def refresh_session(
+        db: Session, raw_refresh_token: str, request: Request | None = None
+    ) -> tuple[User, str, str] | None:
+        """Returns (user, new_access_token, new_refresh_token) or None."""
+        if not raw_refresh_token:
+            return None
+
+        token_hash = hash_token(raw_refresh_token)
+
+        try:
+            session = db.execute(
+                select(UserSession).where(
+                    UserSession.refresh_token_hash == token_hash
+                )
+            ).scalar_one_or_none()
+        except Exception:
+            logger.error("DB error during refresh:\n%s", traceback.format_exc())
+            return None
+
+        if not session:
+            logger.warning("Refresh failed — session not found")
+            _log_audit(db, "refresh_failed", False, reason="session_not_found", request=request)
+            return None
+
+        if session.revoked_at:
+            logger.warning("Refresh failed — session revoked")
+            _log_audit(db, "refresh_failed", False, session.user_id, reason="session_revoked", request=request)
+            return None
+
+        if session.expires_at and session.expires_at < datetime.now(timezone.utc):
+            logger.warning("Refresh failed — session expired")
+            _log_audit(db, "refresh_failed", False, session.user_id, reason="session_expired", request=request)
+            return None
+
+        try:
+            user = db.execute(
+                select(User).where(User.id == session.user_id)
+            ).scalar_one_or_none()
+        except Exception:
+            logger.error("DB error fetching user during refresh:\n%s", traceback.format_exc())
+            return None
+
+        if not user or not user.is_active:
+            logger.warning("Refresh failed — user inactive or missing")
+            _log_audit(db, "refresh_failed", False, session.user_id, reason="user_inactive", request=request)
+            if session:
+                session.revoked_at = datetime.now(timezone.utc)
+                db.commit()
+            return None
+
+        new_refresh_token = create_refresh_token()
+        new_token_hash = hash_token(new_refresh_token)
+
+        try:
+            session.refresh_token_hash = new_token_hash
+            session.last_seen_at = datetime.now(timezone.utc)
+            if request:
+                ip = _get_client_ip(request)
+                session.ip_hash = _hash_ip(ip) if ip else None
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.error("DB error rotating refresh token:\n%s", traceback.format_exc())
+            return None
+
+        access_token = create_access_token(user.id, user.role)
+        _log_audit(db, "refresh_success", True, user.id, request=request)
+
+        logger.info("Session refreshed for user id=%s", user.id)
+        return user, access_token, new_refresh_token
+
+    @staticmethod
+    def logout_session(
+        db: Session, raw_refresh_token: str, request: Request | None = None
+    ) -> bool:
+        """Revoke the session matching the given refresh token. Returns True if found."""
+        if not raw_refresh_token:
+            return False
+
+        token_hash = hash_token(raw_refresh_token)
+
+        try:
+            session = db.execute(
+                select(UserSession).where(
+                    UserSession.refresh_token_hash == token_hash
+                )
+            ).scalar_one_or_none()
+        except Exception:
+            logger.error("DB error during logout:\n%s", traceback.format_exc())
+            return False
+
+        if not session:
+            logger.warning("Logout — session not found for token")
+            return False
+
+        try:
+            session.revoked_at = datetime.now(timezone.utc)
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.error("DB error revoking session:\n%s", traceback.format_exc())
+            return False
+
+        _log_audit(db, "logout", True, session.user_id, request=request)
+        logger.info("Session revoked for user id=%s", session.user_id)
+        return True
+
+    @staticmethod
+    def logout_all_sessions(
+        db: Session, user_id: uuid.UUID, request: Request | None = None
+    ) -> bool:
+        try:
+            sessions = db.execute(
+                select(UserSession).where(
+                    UserSession.user_id == user_id,
+                    UserSession.revoked_at.is_(None),
+                )
+            ).scalars().all()
+
+            now = datetime.now(timezone.utc)
+            for s in sessions:
+                s.revoked_at = now
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.error("DB error revoking all sessions:\n%s", traceback.format_exc())
+            return False
+
+        _log_audit(db, "logout_all", True, user_id, request=request)
+        logger.info("All sessions revoked for user id=%s", user_id)
+        return True
 
     @staticmethod
     def verify_email(db: Session, token: str) -> bool:
@@ -183,7 +414,7 @@ class AuthService:
         return True
 
     @staticmethod
-    def reset_password(db: Session, token: str, new_password: str) -> bool:
+    def reset_password(db: Session, token: str, new_password: str, request: Request | None = None) -> bool:
         try:
             user = db.execute(
                 select(User).where(User.password_reset_token == token)
@@ -213,7 +444,10 @@ class AuthService:
             logger.error("DB error saving new password:\n%s", traceback.format_exc())
             raise
 
-        logger.info("Password reset successful for user id=%s", user.id)
+        AuthService.logout_all_sessions(db, user.id, request)
+        _log_audit(db, "password_reset_success", True, user.id, request=request)
+
+        logger.info("Password reset successful for user id=%s — sessions revoked", user.id)
         return True
 
     @staticmethod

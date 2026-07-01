@@ -63,6 +63,11 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
+class RefreshResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
 class UserOut(BaseModel):
     id: uuid.UUID
     public_id: str
@@ -70,6 +75,7 @@ class UserOut(BaseModel):
     full_name: str
     email: str
     mobile: str | None
+    role: str = "user"
     is_email_verified: bool
     is_logged_in: bool
     last_login_at: datetime | None

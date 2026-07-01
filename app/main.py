@@ -10,9 +10,11 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app.api.v1 import api_router
+from app.api.comparison import router as comparison_router
+from app.api.landing import router as landing_router
 from app.api.v1.sitemap import router as sitemap_router
 from app.config import get_settings
-from app.database import engine, Base, SessionLocal
+from app.database import SessionLocal
 from app.models.broker import Broker
 from app.services.market_data_service import MarketDataService
 from app.services.broker_service import BrokerService
@@ -201,13 +203,6 @@ def _seed_default_broker():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting %s v%s ...", settings.APP_NAME, settings.APP_VERSION)
-    try:
-        Base.metadata.create_all(bind=engine)
-        logger.info("Database tables ensured")
-    except Exception:
-        logger.error("Failed to create database tables:\n%s", traceback.format_exc())
-        raise
-
     _seed_default_broker()
 
     await _initial_data_load()
@@ -342,6 +337,8 @@ async def log_requests(request: Request, call_next):
 
 
 app.include_router(api_router)
+app.include_router(comparison_router)
+app.include_router(landing_router)
 app.include_router(sitemap_router)
 
 

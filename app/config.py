@@ -16,6 +16,19 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
 
+    # Refresh Token
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 30
+
+    # Auth Cookies
+    AUTH_REFRESH_COOKIE_NAME: str = "refresh_token"
+    AUTH_COOKIE_SECURE: bool = True
+    AUTH_COOKIE_SAMESITE: str = "lax"
+
+    # Rate Limiting
+    RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_ATTEMPTS: int = 5
+    RATE_LIMIT_WINDOW_MINUTES: int = 15
+
     # Email Verification Token
     EMAIL_VERIFY_TOKEN_EXPIRE_HOURS: int = 24
 
@@ -37,7 +50,7 @@ class Settings(BaseSettings):
     REDIS_CACHE_TTL: int = 300  # 5 minutes default
 
     # Graph Pipeline
-    GRAPH_PIPELINE_ENABLED: bool = True
+    GRAPH_PIPELINE_ENABLED: bool = False
     GRAPH_PIPELINE_INITIAL_DELAY_SECONDS: int = 600  # 10 min before first run
 
     # Logging

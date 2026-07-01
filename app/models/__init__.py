@@ -17,6 +17,10 @@ from app.models.graph import (
     PropagationScore,
 )
 from app.models.service_monitor import ServiceRegistry, ServiceRun, TableMetadata
+from app.models.compare import StockCompareCache
+from app.models.stock_info import StockInfo
+from app.models.user_session import UserSession
+from app.models.login_audit import LoginAuditEvent
 
 __all__ = [
     "User",
@@ -44,4 +48,8 @@ __all__ = [
     "ServiceRegistry",
     "ServiceRun",
     "TableMetadata",
+    "StockCompareCache",
+    "StockInfo",
+    "UserSession",
+    "LoginAuditEvent",
 ]

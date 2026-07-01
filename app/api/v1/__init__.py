@@ -9,6 +9,7 @@ from app.api.v1.waitlist import router as waitlist_router
 from app.api.v1.graph import router as graph_router
 from app.api.v1.fno import router as fno_router
 from app.api.v1.admin_monitor import router as admin_monitor_router
+from app.api.v1.stocks import router as stocks_router
 
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(auth_router, prefix="/auth", tags=["Authentication"])
@@ -20,3 +21,4 @@ api_router.include_router(waitlist_router, prefix="/waitlist", tags=["Waitlist"]
 api_router.include_router(graph_router, prefix="/graph", tags=["Graph Intelligence"])
 api_router.include_router(fno_router, prefix="/fno", tags=["F&O"])
 api_router.include_router(admin_monitor_router)
+api_router.include_router(stocks_router, prefix="/stocks", tags=["Stocks"])

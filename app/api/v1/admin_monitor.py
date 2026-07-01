@@ -4,11 +4,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import text, func as sa_func
 from app.database import get_db
+from app.dependencies.auth import get_current_admin_user
 from app.models.service_monitor import ServiceRegistry, ServiceRun, TableMetadata
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/admin", tags=["Admin Monitoring"])
+router = APIRouter(prefix="/admin", tags=["Admin Monitoring"], dependencies=[Depends(get_current_admin_user)])
 
 
 @router.get("/services")

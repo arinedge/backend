@@ -1,0 +1,1523 @@
+from __future__ import annotations
+
+import math
+import re
+import threading
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
+from difflib import SequenceMatcher
+from typing import Any
+
+from sqlalchemy import MetaData, Table, String, desc, func, inspect, or_, select
+from sqlalchemy.exc import NoSuchTableError
+from sqlalchemy.orm import Session, joinedload
+
+from app.models.fno import FnoSymbol
+from app.models.graph import (
+    CanonicalEntity,
+    EntityAlias,
+    EntityResolutionLog,
+    GraphEvent,
+    GraphMetric,
+    Relationship,
+)
+from app.models.compare import StockCompareCache
+from app.models.market_data import MarketData
+from app.models.news import NewsArticle
+from app.schemas.compare import (
+    ComparisonErrorItem,
+    ComparisonErrorResponse,
+    ComparisonRequest,
+    ComparisonSuggestion,
+    CoreComparison,
+    DataQuality,
+    DetailComparison,
+    RelatedLink,
+    SeoEligibility,
+    StockComparisonResponse,
+    StockIdentity,
+)
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+_shared_metadata = MetaData()
+_shared_table_cache: dict[str, Table | None] = {}
+_shared_table_names: set[str] | None = None
+_shared_cache_lock = threading.Lock()
+
+_SUFFIX_PATTERNS = [
+    r"\blimited\b",
+    r"\bltd\b",
+    r"\bindia\b",
+    r"\bco\b",
+    r"\bcompany\b",
+    r"\bprivate\b",
+    r"\bpublic\b",
+]
+
+COMPARE_CACHE_TTL_DAYS = 7
+
+
+def _safe_float(value: Any | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isfinite(result):
+        return result
+    return None
+
+
+def _convert_numeric_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        k: float(v) if isinstance(v, Decimal) else v
+        for k, v in row.items()
+    }
+
+
+def _safe_int(value: Any | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_number(value: Any | None) -> float:
+    numeric = _safe_float(value)
+    return numeric if numeric is not None else 0.0
+
+
+def _safe_date(value: datetime | date | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return None
+
+
+def _safe_datetime(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc).isoformat()
+    return value.isoformat()
+
+
+def _slugify(value: str) -> str:
+    slug = value.lower().strip()
+    slug = slug.replace("&", " and ")
+    slug = re.sub(r"[^a-z0-9]+", "-", slug)
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    return slug
+
+
+def _normalize_input(value: str) -> str:
+    lowered = value.lower().strip()
+    lowered = lowered.replace("&", " and ")
+    lowered = re.sub(r"[-_/.]", " ", lowered)
+    lowered = re.sub(r"[^\w\s]", "", lowered)
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    for pattern in _SUFFIX_PATTERNS:
+        lowered = re.sub(pattern, "", lowered)
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    return lowered.replace(" ", "")
+
+
+def _normalized_variants(value: str) -> set[str]:
+    variants = {value}
+    base = value.lower().strip()
+    variants.add(base)
+    variants.add(_normalize_input(base))
+    variants.add(re.sub(r"[^\w]", "", base.lower()))
+    variants.add(base.replace("&", "and"))
+    variants.add(base.replace(" ", ""))
+    variants.add(base.replace("-", ""))
+    variants.add(base.replace(" ", "-"))
+    return {v for v in variants if v}
+
+
+def _display_name(name: str | None, fallback: str) -> str:
+    if name and name.strip():
+        return name.strip()
+    return fallback
+
+
+def _metric_value(raw: Any | None, unit: str | None = None) -> str | None:
+    if raw is None:
+        return None
+    if isinstance(raw, float) and (math.isnan(raw) or math.isinf(raw)):
+        return None
+    if unit == "%" and isinstance(raw, (int, float)):
+        return f"{raw:.2f}%"
+    if unit and isinstance(raw, (int, float)):
+        return f"{raw:,.2f} {unit}"
+    if isinstance(raw, (int, float)):
+        return f"{raw:,.2f}"
+    return str(raw)
+
+
+@dataclass
+class _ResolvedCandidate:
+    entity_id: int | None
+    company_name: str
+    symbol: str | None
+    slug: str
+    exchange_symbol: str | None
+    isin: str | None
+    sector: str | None
+    industry: str | None
+    market_cap: float | None
+    listing_status: str
+    is_fno: bool
+    resolved_from: str
+    resolution_confidence: float
+    source_tables: list[str]
+    description: str | None = None
+    short_name: str | None = None
+    ticker: str | None = None
+
+
+class StockResolverService:
+    def __init__(self, db: Session):
+        self.db = db
+        global _shared_table_names
+        if _shared_table_names is None:
+            with _shared_cache_lock:
+                if _shared_table_names is None:
+                    _shared_table_names = set(inspect(db.get_bind()).get_table_names())
+        self._table_names = _shared_table_names
+        self._optional_cache: dict[str, Table | None] = {}
+
+    def _table_exists(self, name: str) -> bool:
+        return name in self._table_names or f"public.{name}" in self._table_names
+
+    def _get_reflected_table(self, name: str) -> Table | None:
+        if name in _shared_table_cache:
+            return _shared_table_cache[name]
+        if not self._table_exists(name):
+            _shared_table_cache[name] = None
+            return None
+        with _shared_cache_lock:
+            if name in _shared_table_cache:
+                return _shared_table_cache[name]
+            try:
+                table = Table(name, _shared_metadata, autoload_with=self.db.get_bind())
+            except NoSuchTableError:
+                try:
+                    table = Table(name, _shared_metadata, schema="public", autoload_with=self.db.get_bind())
+                except NoSuchTableError:
+                    table = None
+            _shared_table_cache[name] = table
+            return table
+
+    def _entity_from_row(self, row: CanonicalEntity, resolved_from: str, confidence: float) -> _ResolvedCandidate:
+        ticker = (row.ticker or "").strip() or None
+        company_name = _display_name(row.canonical_name, ticker or "Unknown")
+        slug_source = ticker or company_name
+        slug = _slugify(slug_source)
+        exchange_symbol = f"{ticker}.NS" if ticker else None
+        market_cap = self._metadata_number(row.meta_data if hasattr(row, "meta_data") else None, ["market_cap", "marketCap", "mcap"])
+        industry = self._metadata_text(row.meta_data if hasattr(row, "meta_data") else None, ["industry", "industry_name"])
+        short_name = self._metadata_text(row.meta_data if hasattr(row, "meta_data") else None, ["short_name", "shortName", "display_name"])
+        return _ResolvedCandidate(
+            entity_id=row.id,
+            company_name=company_name,
+            symbol=ticker,
+            slug=slug,
+            exchange_symbol=exchange_symbol,
+            isin=row.isin,
+            sector=row.sector,
+            industry=industry,
+            market_cap=market_cap,
+            listing_status="listed",
+            is_fno=self._is_fno_symbol(ticker, company_name, slug),
+            resolved_from=resolved_from,
+            resolution_confidence=confidence,
+            source_tables=["nse_canonical_entities"],
+            description=row.description,
+            short_name=short_name,
+            ticker=ticker,
+        )
+
+    def _metadata_text(self, meta: dict | None, keys: list[str]) -> str | None:
+        if not isinstance(meta, dict):
+            return None
+        for key in keys:
+            value = meta.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _metadata_number(self, meta: dict | None, keys: list[str]) -> float | None:
+        if not isinstance(meta, dict):
+            return None
+        for key in keys:
+            value = meta.get(key)
+            num = _safe_float(value)
+            if num is not None:
+                return num
+        return None
+
+    def _is_fno_symbol(self, *candidates: str | None) -> bool:
+        variants = {candidate.upper() for candidate in candidates if candidate}
+        if not variants:
+            return False
+        return bool(
+            self.db.query(FnoSymbol.id)
+            .filter(func.upper(FnoSymbol.symbol).in_(variants))
+            .first()
+        )
+
+    def _candidate_from_canonical(self, entity: CanonicalEntity, resolved_from: str, confidence: float) -> _ResolvedCandidate:
+        return self._entity_from_row(entity, resolved_from, confidence)
+
+    def _candidate_from_alias(self, alias: EntityAlias, entity: CanonicalEntity, resolved_from: str, confidence: float) -> _ResolvedCandidate:
+        candidate = self._entity_from_row(entity, resolved_from, confidence)
+        candidate.source_tables.append("nse_entity_aliases")
+        return candidate
+
+    def _candidate_from_fno(self, symbol: FnoSymbol, resolved_from: str, confidence: float) -> _ResolvedCandidate:
+        company_name = _display_name(symbol.name, symbol.symbol)
+        slug = _slugify(symbol.symbol)
+        return _ResolvedCandidate(
+            entity_id=None,
+            company_name=company_name,
+            symbol=symbol.symbol,
+            slug=slug,
+            exchange_symbol=f"{symbol.symbol}.NS" if symbol.exchange.upper() == "NSE" else symbol.symbol,
+            isin=None,
+            sector=None,
+            industry=None,
+            market_cap=None,
+            listing_status="listed",
+            is_fno=True,
+            resolved_from=resolved_from,
+            resolution_confidence=confidence,
+            source_tables=["fno_symbols"],
+            description=None,
+            short_name=None,
+            ticker=symbol.symbol,
+        )
+
+    def _candidate_from_market_data_symbol(self, symbol: str, resolved_from: str, confidence: float) -> _ResolvedCandidate:
+        company_name = symbol
+        slug = _slugify(symbol)
+        return _ResolvedCandidate(
+            entity_id=None,
+            company_name=company_name,
+            symbol=symbol,
+            slug=slug,
+            exchange_symbol=symbol,
+            isin=None,
+            sector=None,
+            industry=None,
+            market_cap=None,
+            listing_status="listed",
+            is_fno=self._is_fno_symbol(symbol),
+            resolved_from=resolved_from,
+            resolution_confidence=confidence,
+            source_tables=["market_data"],
+            description=None,
+            short_name=None,
+            ticker=symbol,
+        )
+
+    def _query_exact_canonical(self, normalized: str) -> list[tuple[_ResolvedCandidate, str]]:
+        matches: list[tuple[_ResolvedCandidate, str]] = []
+        upper_input = normalized.upper()
+        entity = (
+            self.db.query(CanonicalEntity)
+            .filter(CanonicalEntity.ticker.isnot(None), func.upper(CanonicalEntity.ticker) == upper_input)
+            .first()
+        )
+        if entity and normalized in {
+            _normalize_input(entity.canonical_name),
+            _normalize_input(entity.ticker or ""),
+            _normalize_input(_slugify(entity.canonical_name)),
+            _normalize_input(_slugify(entity.ticker or "")),
+        }:
+            return [(self._candidate_from_canonical(
+                entity, "symbol" if normalized == _normalize_input(entity.ticker or "") else "company_name", 1.0
+            ), "exact")]
+        entities = (
+            self.db.query(CanonicalEntity)
+            .options(joinedload(CanonicalEntity.aliases))
+            .filter(
+                or_(
+                    func.lower(CanonicalEntity.canonical_name).contains(normalized),
+                    func.lower(CanonicalEntity.ticker).contains(normalized),
+                )
+            )
+            .all()
+        )
+        for entity in entities:
+            exact_values = {
+                _normalize_input(entity.canonical_name),
+                _normalize_input(entity.ticker or ""),
+                _normalize_input(_slugify(entity.canonical_name)),
+                _normalize_input(_slugify(entity.ticker or "")),
+            }
+            if normalized in exact_values:
+                matches.append((self._candidate_from_canonical(entity, "company_name" if normalized == _normalize_input(entity.canonical_name) else "symbol", 1.0), "exact"))
+        return matches
+
+    def _query_alias_matches(self, normalized: str) -> list[tuple[_ResolvedCandidate, str]]:
+        results: list[tuple[_ResolvedCandidate, str]] = []
+        alias_match = (
+            self.db.query(EntityAlias)
+            .options(joinedload(EntityAlias.entity))
+            .filter(func.lower(EntityAlias.alias) == normalized.lower())
+            .first()
+        )
+        if alias_match and _normalize_input(alias_match.alias) == normalized:
+            results.append((self._candidate_from_alias(alias_match, alias_match.entity, "alias", 0.99), "exact"))
+            return results
+        alias_matches = (
+            self.db.query(EntityAlias)
+            .options(joinedload(EntityAlias.entity))
+            .filter(func.lower(EntityAlias.alias).contains(normalized))
+            .all()
+        )
+        seen: set[int] = set()
+        for alias_match in alias_matches:
+            if alias_match.canonical_id in seen:
+                continue
+            seen.add(alias_match.canonical_id)
+            if _normalize_input(alias_match.alias) == normalized:
+                results.append((self._candidate_from_alias(alias_match, alias_match.entity, "alias", 0.99), "exact"))
+        return results
+
+    def _query_fno_matches(self, normalized: str) -> list[tuple[_ResolvedCandidate, str]]:
+        results: list[tuple[_ResolvedCandidate, str]] = []
+        upper_input = normalized.upper()
+        row = (
+            self.db.query(FnoSymbol)
+            .filter(FnoSymbol.is_active == True, func.upper(FnoSymbol.symbol) == upper_input)
+            .first()
+        )
+        if row:
+            results.append((self._candidate_from_fno(row, "symbol", 0.98), "exact"))
+            return results
+        for row in self.db.query(FnoSymbol).filter(FnoSymbol.is_active == True).all():
+            if _normalize_input(row.name) == normalized:
+                results.append((self._candidate_from_fno(row, "symbol", 0.98), "exact"))
+                break
+        return results
+
+    def _query_market_data_matches(self, normalized: str) -> list[tuple[_ResolvedCandidate, str]]:
+        symbol = normalized.upper()
+        exists = (
+            self.db.query(MarketData.symbol)
+            .filter(func.upper(MarketData.symbol) == symbol)
+            .first()
+        )
+        if exists:
+            return [(self._candidate_from_market_data_symbol(symbol, "market_data", 0.95), "exact")]
+        return []
+
+    def _query_optional_stock_info(self, normalized: str) -> list[tuple[_ResolvedCandidate, str]]:
+        for table_name in ("nse_securities", "nse_security_attributes"):
+            table = self._get_reflected_table(table_name)
+            if table is not None:
+                break
+        if table is None:
+            table = self._get_reflected_table("stock_info")
+        if table is None:
+            return []
+
+        columns = table.c
+        symbol_cols = [c for c in ("symbol", "ticker", "stock_symbol", "company_symbol", "security_symbol", "slug", "primary_symbol") if c in columns]
+        name_cols = [c for c in ("company_name", "name", "short_name", "security_name", "current_name") if c in columns]
+        conditions = []
+        for col_name in symbol_cols + name_cols:
+            conditions.append(func.lower(columns[col_name].cast(String())) == normalized)
+        if not conditions:
+            return []
+        row = self.db.execute(select(table).where(or_(*conditions)).limit(1)).mappings().first()
+        if not row:
+            return []
+        symbol = row.get("symbol") or row.get("ticker") or row.get("primary_symbol") or row.get("stock_symbol") or row.get("security_symbol")
+        company_name = row.get("company_name") or row.get("name") or row.get("current_name") or row.get("short_name") or symbol or "Unknown"
+        slug = row.get("slug") or _slugify(str(symbol or company_name))
+        market_cap = _safe_float(row.get("market_cap") or row.get("mcap"))
+        sector = row.get("sector")
+        industry = row.get("industry") or row.get("industry_name")
+        listing_status = str(row.get("listing_status") or row.get("status") or "listed").lower()
+        if listing_status not in {"listed", "delisted", "unknown"}:
+            listing_status = "unknown"
+        isin = row.get("isin") or row.get("isin_code")
+        return [(
+            _ResolvedCandidate(
+                entity_id=_safe_int(row.get("entity_id") or row.get("canonical_id")),
+                company_name=str(company_name),
+                symbol=str(symbol) if symbol else None,
+                slug=str(slug),
+                exchange_symbol=row.get("exchange_symbol") or (f"{symbol}.NS" if symbol else None),
+                isin=isin,
+                sector=sector,
+                industry=industry,
+                market_cap=market_cap,
+                listing_status=listing_status,
+                is_fno=self._is_fno_symbol(str(symbol) if symbol else None, str(company_name)),
+                resolved_from="nse_security",
+                resolution_confidence=0.97,
+                source_tables=[table.name],
+                description=row.get("description") or row.get("business_description"),
+                short_name=row.get("short_name") or row.get("display_name"),
+                ticker=str(symbol) if symbol else None,
+            ),
+            "exact",
+        )]
+
+    def _fuzzy_candidates(self, normalized: str) -> list[ComparisonSuggestion]:
+        suggestions: list[ComparisonSuggestion] = []
+        universe: list[tuple[str, _ResolvedCandidate]] = []
+
+        for entity in self.db.query(CanonicalEntity).options(joinedload(CanonicalEntity.aliases)).all():
+            candidate = self._candidate_from_canonical(entity, "fuzzy", 0.0)
+            universe.append((entity.canonical_name, candidate))
+            if entity.ticker:
+                universe.append((entity.ticker, candidate))
+            for alias in entity.aliases:
+                universe.append((alias.alias, candidate))
+
+        for row in self.db.query(FnoSymbol).filter(FnoSymbol.is_active == True).all():
+            universe.append((row.symbol, self._candidate_from_fno(row, "fuzzy", 0.0)))
+            universe.append((row.name, self._candidate_from_fno(row, "fuzzy", 0.0)))
+
+        scored: list[tuple[float, _ResolvedCandidate]] = []
+        for label, candidate in universe:
+            norm_label = _normalize_input(label)
+            if not norm_label:
+                continue
+            score = SequenceMatcher(None, normalized, norm_label).ratio()
+            if score >= 0.55:
+                scored.append((score, candidate))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        unique: set[str] = set()
+        for score, candidate in scored[:6]:
+            key = candidate.slug
+            if key in unique:
+                continue
+            unique.add(key)
+            suggestions.append(self._suggestion_from_candidate(candidate, resolution_confidence=round(score, 3)))
+        return suggestions
+
+    def _suggestion_from_candidate(self, candidate: _ResolvedCandidate, resolution_confidence: float | None = None) -> ComparisonSuggestion:
+        return ComparisonSuggestion(
+            symbol=candidate.symbol,
+            company_name=candidate.company_name,
+            slug=candidate.slug,
+            canonical_path=f"/stocks/{candidate.slug}",
+            exchange_symbol=candidate.exchange_symbol,
+            isin=candidate.isin,
+            sector=candidate.sector,
+            industry=candidate.industry,
+            listing_status=candidate.listing_status,
+            is_fno=candidate.is_fno,
+            resolution_confidence=resolution_confidence if resolution_confidence is not None else candidate.resolution_confidence,
+        )
+
+    def resolve_stock(self, stock_input: str) -> tuple[StockIdentity | None, list[ComparisonSuggestion], str | None]:
+        normalized = _normalize_input(stock_input)
+        if not normalized:
+            return None, [], "Empty stock input"
+
+        exact_sources: list[tuple[_ResolvedCandidate, str]] = []
+        exact_sources.extend(self._query_exact_canonical(normalized))
+        exact_sources.extend(self._query_alias_matches(normalized))
+        exact_sources.extend(self._query_fno_matches(normalized))
+
+        if not exact_sources:
+            exact_sources.extend(self._query_market_data_matches(normalized))
+
+        if not exact_sources:
+            exact_sources.extend(self._query_optional_stock_info(normalized))
+
+        if exact_sources:
+            best_score = max(candidate.resolution_confidence for candidate, _ in exact_sources)
+            best = [candidate for candidate, _ in exact_sources if candidate.resolution_confidence == best_score]
+            if len(best) > 1:
+                suggestions = [self._suggestion_from_candidate(candidate, candidate.resolution_confidence) for candidate in best[:6]]
+                return None, suggestions, "Ambiguous stock input"
+            candidate = best[0]
+
+            if not candidate.symbol:
+                for other, _ in exact_sources:
+                    if other.symbol and other.resolution_confidence > 0.5:
+                        candidate.symbol = other.symbol
+                        candidate.exchange_symbol = other.exchange_symbol
+                        candidate.ticker = other.ticker
+                        candidate.is_fno = candidate.is_fno or other.is_fno
+                        if "fno_symbols" not in candidate.source_tables:
+                            candidate.source_tables = list(dict.fromkeys(candidate.source_tables + other.source_tables))
+                        break
+
+            return self._to_identity(candidate), [], None
+
+        suggestions = self._fuzzy_candidates(normalized)
+        if suggestions:
+            return None, suggestions, "Stock could not be resolved"
+        return None, [], "Stock could not be resolved"
+
+    def _to_identity(self, candidate: _ResolvedCandidate) -> StockIdentity:
+        return StockIdentity(
+            symbol=candidate.symbol,
+            exchange_symbol=candidate.exchange_symbol,
+            slug=candidate.slug,
+            company_name=candidate.company_name,
+            short_name=candidate.short_name,
+            description=candidate.description,
+            isin=candidate.isin,
+            sector=candidate.sector,
+            industry=candidate.industry,
+            market_cap=candidate.market_cap,
+            listing_status=candidate.listing_status,
+            is_fno=candidate.is_fno,
+            canonical_path=f"/stocks/{candidate.slug}",
+            resolved_from=candidate.resolved_from,
+            resolution_confidence=round(candidate.resolution_confidence, 3),
+            entity_id=candidate.entity_id,
+            source_tables=candidate.source_tables,
+        )
+
+
+class StockCompareService:
+    FINANCIAL_LINE_ITEMS = [
+        "Total Revenue", "Operating Revenue", "Net Income", "Net Income Common Stockholders",
+        "Basic EPS", "Diluted EPS", "Interest Income", "Interest Expense", "Net Interest Income",
+        "Operating Expense", "Pretax Income", "Net Income Continuous Operations",
+        "Net Income From Continuing Operations",
+    ]
+    CASH_FLOW_ITEMS = [
+        "Operating Cash Flow", "Free Cash Flow", "Capital Expenditure",
+        "Cash Dividends Paid", "Financing Cash Flow", "Investing Cash Flow",
+        "Beginning Cash Position", "End Cash Position", "Changes In Cash",
+        "Cash Flow From Continuing Operating Activities",
+        "Cash Flow From Continuing Financing Activities",
+        "Cash Flow From Continuing Investing Activities",
+    ]
+    BALANCE_SHEET_ITEMS = [
+        "Total Assets", "Total Debt", "Cash And Cash Equivalents",
+        "Total Equity Gross Minority Interest", "Total Liabilities Net Minority Interest",
+        "Common Stock Equity", "Tangible Book Value", "Goodwill And Other Intangible Assets",
+        "Invested Capital", "Net Tangible Assets",
+    ]
+
+    def __init__(self, db: Session):
+        self.db = db
+        self.resolver = StockResolverService(db)
+        global _shared_table_names
+        if _shared_table_names is None:
+            _shared_table_names = set(inspect(db.get_bind()).get_table_names())
+        self._table_names = _shared_table_names
+        self._reflected_cache: dict[str, Table | None] = {}
+
+    def _table_exists(self, name: str) -> bool:
+        return name in self._table_names or f"public.{name}" in self._table_names
+
+    def _get_table(self, name: str) -> Table | None:
+        if name in _shared_table_cache:
+            return _shared_table_cache[name]
+        if not self._table_exists(name):
+            _shared_table_cache[name] = None
+            return None
+        with _shared_cache_lock:
+            if name in _shared_table_cache:
+                return _shared_table_cache[name]
+            try:
+                table = Table(name, _shared_metadata, autoload_with=self.db.get_bind())
+            except NoSuchTableError:
+                try:
+                    table = Table(name, _shared_metadata, schema="public", autoload_with=self.db.get_bind())
+                except NoSuchTableError:
+                    table = None
+            _shared_table_cache[name] = table
+            return table
+
+    def _exchange_ticker(self, stock: StockIdentity) -> str | None:
+        if stock.symbol:
+            return f"{stock.symbol}.NS"
+        return None
+
+    def _fetch_financials_eav(self, ticker: str) -> dict[str, dict[str, Any]]:
+        table = self._get_table("stock_financials")
+        if table is None:
+            return {}
+        columns = table.c
+        rows = self.db.execute(
+            select(table)
+            .where(func.lower(columns["ticker"]) == ticker.lower())
+            .order_by(desc(columns["fiscal_date"]))
+        ).mappings().all()
+        if not rows:
+            return {}
+        result: dict[str, dict[str, Any]] = {}
+        latest_dates: dict[str, date] = {}
+        for row in rows:
+            st = row["statement_type"]
+            fd = row["fiscal_date"]
+            if st is None or fd is None:
+                continue
+            if st not in latest_dates or fd > latest_dates[st]:
+                latest_dates[st] = fd
+        for row in rows:
+            st = row["statement_type"]
+            fd = row["fiscal_date"]
+            if st is None or fd is None:
+                continue
+            if fd == latest_dates.get(st):
+                if st not in result:
+                    result[st] = {}
+                result[st][row["line_item"]] = row["value"]
+        return result
+
+    def _pivot_from_financials(self, fin: dict[str, dict[str, Any]], stmt_type: str, fields: list[str]) -> dict[str, Any]:
+        stmt = fin.get(stmt_type, {})
+        return {field: _safe_float(stmt.get(field)) for field in fields}
+
+    def _fetch_stock_info(self, ticker: str) -> dict[str, Any] | None:
+        table = self._get_table("stock_info")
+        if table is None:
+            return None
+        columns = table.c
+        row = self.db.execute(
+            select(table)
+            .where(func.lower(columns["ticker"]) == ticker.lower())
+            .order_by(desc(columns["fetched_at"]))
+            .limit(1)
+        ).mappings().first()
+        if row and row.get("data"):
+            return row["data"]
+        return None
+
+    def _fetch_stock_prices(self, ticker: str, limit: int = 400) -> list[dict[str, Any]]:
+        table = self._get_table("stock_prices")
+        if table is None:
+            return []
+        columns = table.c
+        rows = self.db.execute(
+            select(table)
+            .where(func.lower(columns["ticker"]) == ticker.lower())
+            .order_by(desc(columns["date"]))
+            .limit(limit)
+        ).mappings().all()
+        if not rows and "symbol" in columns:
+            symbol = ticker.replace(".NS", "").lower()
+            rows = self.db.execute(
+                select(table)
+                .where(func.lower(columns["symbol"]) == symbol)
+                .order_by(desc(columns["date"]))
+                .limit(limit)
+            ).mappings().all()
+        return [_convert_numeric_row(dict(r)) for r in rows]
+
+    def _fetch_stock_holders(self, ticker: str) -> dict[str, float]:
+        table = self._get_table("stock_holders")
+        if table is None:
+            return {}
+        columns = table.c
+        result = self.db.execute(
+            select(table)
+            .where(func.lower(columns["ticker"]) == ticker.lower())
+            .order_by(desc(columns["date_reported"]))
+        ).mappings().all()
+        holder_pcts: dict[str, float] = {}
+        seen: set[str] = set()
+        for row in result:
+            htype = str(row.get("holder_type", ""))
+            if htype in seen:
+                continue
+            seen.add(htype)
+            pct = _safe_float(row.get("percent_held"))
+            if pct is not None:
+                holder_pcts[htype] = pct
+        return holder_pcts
+
+    def _fetch_nexus_options(self, symbol: str) -> dict[str, Any] | None:
+        table = self._get_table("nexus_option_snapshots")
+        if table is None:
+            return None
+        columns = table.c
+        row = self.db.execute(
+            select(table)
+            .where(func.lower(columns["underlying_symbol"]) == symbol.lower())
+            .order_by(desc(columns["snapshot_timestamp"]))
+            .limit(1)
+        ).mappings().first()
+        if row:
+            return _convert_numeric_row(dict(row))
+        return None
+
+    def _fetch_nexus_expiry_intel(self, symbol: str) -> dict[str, Any] | None:
+        table = self._get_table("nexus_expiry_intel")
+        if table is None:
+            return None
+        columns = table.c
+        row = self.db.execute(
+            select(table)
+            .where(func.lower(columns["underlying_symbol"]) == symbol.lower())
+            .order_by(desc(columns["computed_at"]))
+            .limit(1)
+        ).mappings().first()
+        if row:
+            return _convert_numeric_row(dict(row))
+        return None
+
+    def _compute_fno_metrics(self, nexus_row: dict[str, Any] | None, expiry_row: dict[str, Any] | None = None) -> dict[str, Any]:
+        if not nexus_row:
+            return {"is_fno": False}
+        spot_price = _safe_float(nexus_row.get("spot_price"))
+        strike_details = nexus_row.get("strike_details") or []
+        if isinstance(strike_details, str):
+            try:
+                import json
+                strike_details = json.loads(strike_details)
+            except Exception:
+                strike_details = []
+
+        total_call_oi = 0
+        total_put_oi = 0
+        total_call_vol = 0
+        total_put_vol = 0
+        call_strikes: list[dict] = []
+        put_strikes: list[dict] = []
+        clean_strikes = [sd for sd in strike_details if isinstance(sd, dict)]
+        for sd in clean_strikes:
+            oi = _safe_number(sd.get("oi"))
+            vol = _safe_number(sd.get("volume"))
+            if sd.get("option_type") == "CE":
+                total_call_oi += oi
+                total_call_vol += vol
+                call_strikes.append(sd)
+            else:
+                total_put_oi += oi
+                total_put_vol += vol
+                put_strikes.append(sd)
+
+        pcr_oi = round(total_put_oi / total_call_oi, 4) if total_call_oi > 0 else None
+        pcr_volume = round(total_put_vol / total_call_vol, 4) if total_call_vol > 0 else None
+
+        call_strikes.sort(key=lambda x: _safe_number(x.get("oi")), reverse=True)
+        put_strikes.sort(key=lambda x: _safe_number(x.get("oi")), reverse=True)
+
+        atm_iv = None
+        if spot_price and clean_strikes:
+            closest = min(clean_strikes, key=lambda x: abs(_safe_number(x.get("strike")) - spot_price))
+            atm_iv = _safe_float(closest.get("iv"))
+
+        def strike_payload(strike: dict) -> dict[str, Any]:
+            return {
+                "strike": _safe_float(strike.get("strike")),
+                "oi": _safe_float(strike.get("oi")),
+                "iv": _safe_float(strike.get("iv")),
+                "gamma": _safe_float(strike.get("gamma")),
+                "delta": _safe_float(strike.get("delta")),
+            }
+
+        return {
+            "is_fno": True,
+            "spot_price": spot_price,
+            "expiry": str(nexus_row.get("expiry", "")),
+            "pcr_oi": pcr_oi,
+            "pcr_volume": pcr_volume,
+            "atm_iv": atm_iv,
+            "net_gamma": _safe_float(nexus_row.get("net_gamma")),
+            "total_gamma": _safe_float(nexus_row.get("total_gamma")),
+            "gamma_flip_points": nexus_row.get("gamma_flip_points", []),
+            "strike_count": nexus_row.get("strike_count", 0) or len(clean_strikes),
+            "max_pain": _safe_float(expiry_row.get("max_pain")) if expiry_row else None,
+            "days_to_expiry": expiry_row.get("days_to_expiry") if expiry_row else None,
+            "top_call_oi": [strike_payload(s) for s in call_strikes[:5]],
+            "top_put_oi": [strike_payload(s) for s in put_strikes[:5]],
+        }
+
+    def _fetch_stock_analysis(self, ticker: str) -> dict[str, Any] | None:
+        table = self._get_table("stock_analysis")
+        if table is None:
+            return None
+        columns = table.c
+        row = self.db.execute(
+            select(table)
+            .where(func.lower(columns["ticker"]) == ticker.lower())
+            .order_by(desc(columns["generated_at"]))
+            .limit(1)
+        ).mappings().first()
+        if row and row.get("summary"):
+            summary = row["summary"]
+            if isinstance(summary, dict):
+                return {
+                    "bull_case": summary.get("bull_case", []),
+                    "bear_case": summary.get("bear_case", []),
+                    "red_flags": summary.get("red_flags", []),
+                    "investment_thesis": summary.get("investment_thesis"),
+                    "confidence_score": summary.get("confidence_score"),
+                    "overall_assessment": summary.get("overall_assessment"),
+                }
+        return None
+
+    def _fetch_insider(self, ticker: str) -> list[dict]:
+        table = self._get_table("stock_insider_transactions")
+        if table is None:
+            return []
+        columns = table.c
+        rows = self.db.execute(
+            select(table).where(func.lower(columns["ticker"]) == ticker.lower())
+            .order_by(desc(columns["transaction_date"]))
+            .limit(10)
+        ).mappings().all()
+        return [
+            {
+                "date": str(r.get("transaction_date", "")),
+                "insider": r.get("insider_name"),
+                "type": r.get("transaction_type"),
+                "shares": _safe_int(r.get("shares")),
+                "price": _safe_float(r.get("price")),
+            }
+            for r in rows
+        ]
+
+    def _fetch_earnings(self, ticker: str) -> list[dict]:
+        table = self._get_table("stock_earnings_dates")
+        if table is None:
+            return []
+        columns = table.c
+        rows = self.db.execute(
+            select(table).where(func.lower(columns["ticker"]) == ticker.lower())
+            .order_by(desc(columns["report_date"]))
+            .limit(4)
+        ).mappings().all()
+        return [
+            {
+                "report_date": str(r.get("report_date", "")),
+                "eps_estimate": _safe_float(r.get("eps_estimate")),
+                "eps_actual": _safe_float(r.get("eps_actual")),
+                "surprise_pct": _safe_float(r.get("surprise_pct")),
+            }
+            for r in rows
+        ]
+
+    def _fetch_fii_dii(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for name, tbl_name in [("fii", "fii_activity"), ("dii", "dii_activity")]:
+            table = self._get_table(tbl_name)
+            if table is None:
+                continue
+            cols = table.c
+            row = self.db.execute(
+                select(table).order_by(desc(cols["trade_date"])).limit(1)
+            ).mappings().first()
+            if row:
+                result[name] = {
+                    "trade_date": str(row.get("trade_date", "")),
+                    "buy_amount": _safe_float(row.get("buy_amount")),
+                    "sell_amount": _safe_float(row.get("sell_amount")),
+                    "net": (_safe_float(row.get("buy_amount")) or 0) - (_safe_float(row.get("sell_amount")) or 0),
+                }
+        return result
+
+    def _fetch_entity_graph(self, stock: StockIdentity) -> dict[str, Any]:
+        if stock.entity_id is None:
+            return {"available": False}
+        entity = self.db.query(CanonicalEntity).options(
+            joinedload(CanonicalEntity.aliases)
+        ).filter(CanonicalEntity.id == stock.entity_id).first()
+        metrics = self.db.query(GraphMetric).filter(GraphMetric.entity_id == stock.entity_id).first()
+        rels = self.db.query(Relationship).filter(
+            or_(Relationship.source_entity == stock.entity_id, Relationship.target_entity == stock.entity_id)
+        ).limit(10).all()
+        return {
+            "available": True,
+            "entity": {
+                "id": entity.id if entity else stock.entity_id,
+                "canonical_name": entity.canonical_name if entity else stock.company_name,
+                "sector": entity.sector if entity else stock.sector,
+            },
+            "graph_metrics": {
+                "pagerank": _safe_float(metrics.pagerank) if metrics else None,
+                "degree_centrality": _safe_float(metrics.degree_centrality) if metrics else None,
+                "betweenness": _safe_float(metrics.betweenness) if metrics else None,
+                "mention_velocity": _safe_float(metrics.mention_velocity) if metrics else None,
+                "sentiment_score": _safe_float(metrics.sentiment_score) if metrics else None,
+            } if metrics else {},
+            "related_entities": [
+                {
+                    "relation_type": rel.relation_type,
+                    "source": rel.source_entity,
+                    "target": rel.target_entity,
+                    "weight": _safe_float(rel.weight),
+                }
+                for rel in rels
+            ],
+        }
+
+    def _fetch_news(self, stock: StockIdentity) -> dict[str, Any]:
+        search_conditions = or_(
+            NewsArticle.title.ilike(f"%{stock.company_name}%"),
+            NewsArticle.description.ilike(f"%{stock.company_name}%"),
+        )
+        if stock.symbol:
+            search_conditions = or_(
+                search_conditions,
+                NewsArticle.title.ilike(f"%{stock.symbol}%"),
+            )
+        now = datetime.now(timezone.utc)
+        count_7d = (
+            self.db.query(func.count(NewsArticle.id))
+            .filter(NewsArticle.published_at >= now - timedelta(days=7))
+            .filter(search_conditions)
+            .scalar()
+        ) or 0
+        count_30d = (
+            self.db.query(func.count(NewsArticle.id))
+            .filter(NewsArticle.published_at >= now - timedelta(days=30))
+            .filter(search_conditions)
+            .scalar()
+        ) or 0
+        articles = (
+            self.db.query(NewsArticle)
+            .filter(search_conditions)
+            .order_by(NewsArticle.published_at.desc().nullslast())
+            .limit(5)
+            .all()
+        )
+        return {
+            "count_7d": count_7d,
+            "count_30d": count_30d,
+            "latest": [
+                {"title": a.title, "source": a.source_name, "published_at": _safe_datetime(a.published_at) if a.published_at else None}
+                for a in articles
+            ],
+        }
+
+    def _holders_from_info(self, info: dict | None) -> dict[str, float]:
+        if not info:
+            return {}
+        return {
+            "promoters": round((_safe_float(info.get("heldPercentInsiders")) or 0) * 100, 2),
+            "institutions": round((_safe_float(info.get("heldPercentInstitutions")) or 0) * 100, 2),
+        }
+
+    def _extract_valuation(self, info: dict | None) -> dict[str, Any]:
+        if not info:
+            return {}
+        return {
+            "pe": _safe_float(info.get("trailingPE")),
+            "forward_pe": _safe_float(info.get("forwardPE")),
+            "pb": _safe_float(info.get("priceToBook")),
+            "ev_to_revenue": _safe_float(info.get("enterpriseToRevenue")),
+            "peg_ratio": _safe_float(info.get("pegRatio")),
+            "market_cap": _safe_float(info.get("marketCap")),
+            "enterprise_value": _safe_float(info.get("enterpriseValue")),
+        }
+
+    def _extract_profitability(self, info: dict | None) -> dict[str, Any]:
+        if not info:
+            return {}
+        return {
+            "roe": _safe_float(info.get("returnOnEquity")),
+            "roa": _safe_float(info.get("returnOnAssets")),
+            "net_margin": _safe_float(info.get("profitMargins")),
+            "operating_margin": _safe_float(info.get("operatingMargins")),
+        }
+
+    def _extract_growth(self, info: dict | None) -> dict[str, Any]:
+        if not info:
+            return {}
+        return {
+            "revenue_growth": _safe_float(info.get("revenueGrowth")),
+            "earnings_growth": _safe_float(info.get("earningsGrowth")),
+            "eps": _safe_float(info.get("trailingEps")),
+            "forward_eps": _safe_float(info.get("forwardEps")),
+            "dividend_yield": _safe_float(info.get("dividendYield")),
+            "dividend_rate": _safe_float(info.get("dividendRate")),
+        }
+
+    def _relative_position(self, a: Any | None, b: Any | None) -> str:
+        a_f = _safe_float(a)
+        b_f = _safe_float(b)
+        if a_f is None or b_f is None:
+            return "not_available"
+        if abs(a_f - b_f) <= max(abs(a_f), abs(b_f), 1.0) * 0.02:
+            return "similar"
+        return "stock1_higher" if a_f > b_f else "stock2_higher"
+
+    def _compare_dicts(self, d1: dict, d2: dict) -> list[dict]:
+        results: list[dict] = []
+        all_keys = set(d1.keys()) | set(d2.keys())
+        for key in sorted(all_keys):
+            v1 = d1.get(key)
+            v2 = d2.get(key)
+            results.append({
+                "metric": key,
+                "stock1": v1,
+                "stock2": v2,
+                "relative_position": self._relative_position(v1, v2),
+            })
+        return results
+
+    def _calc_returns(self, prices: list[dict]) -> dict[str, Any]:
+        if len(prices) < 2:
+            return {}
+        sorted_prices = sorted(prices, key=lambda x: x.get("date", ""))
+        latest = sorted_prices[-1]
+        latest_close = _safe_float(latest.get("close"))
+        if latest_close is None:
+            return {}
+        closes = [_safe_float(p.get("close")) for p in sorted_prices]
+        closes = [c for c in closes if c is not None]
+        if not closes:
+            return {}
+
+        def pct_ret(idx):
+            if idx < 0 or idx >= len(closes):
+                return None
+            base = closes[-(idx + 1)]
+            if base and base != 0:
+                return round(((closes[-1] - base) / base) * 100, 2)
+            return None
+
+        high_52w = max(closes)
+        low_52w = min(closes)
+        return {
+            "latest_close": latest_close,
+            "latest_date": str(latest.get("date", "")),
+            "return_1d": pct_ret(1) if len(closes) >= 2 else None,
+            "return_1w": pct_ret(5) if len(closes) >= 6 else None,
+            "return_1m": pct_ret(21) if len(closes) >= 22 else None,
+            "return_3m": pct_ret(63) if len(closes) >= 64 else None,
+            "return_6m": pct_ret(126) if len(closes) >= 127 else None,
+            "return_1y": pct_ret(252) if len(closes) >= 253 else None,
+            "high_52w": high_52w,
+            "low_52w": low_52w,
+            "volume": _safe_int(latest.get("volume")),
+        }
+
+    def _yfinance_fallback(self, symbol: str | None) -> dict[str, Any] | None:
+        if not symbol:
+            return None
+        try:
+            import yfinance as yf
+            ticker = yf.Ticker(f"{symbol}.NS")
+            info = ticker.info or {}
+            result: dict[str, Any] = {}
+            sector = info.get("sector")
+            if isinstance(sector, str) and sector.strip():
+                result["sector"] = sector.strip()
+            industry = info.get("industry")
+            if isinstance(industry, str) and industry.strip():
+                result["industry"] = industry.strip()
+            mcap = _safe_float(info.get("marketCap"))
+            if mcap is not None:
+                result["market_cap"] = mcap
+            return result if result else None
+        except Exception:
+            return None
+
+    def _build_core(self, stock1: StockIdentity, stock2: StockIdentity) -> CoreComparison:
+        ticker1 = self._exchange_ticker(stock1)
+        ticker2 = self._exchange_ticker(stock2)
+
+        f1 = self._fetch_financials_eav(ticker1) if ticker1 else {}
+        f2 = self._fetch_financials_eav(ticker2) if ticker2 else {}
+        info1 = self._fetch_stock_info(ticker1) if ticker1 else None
+        info2 = self._fetch_stock_info(ticker2) if ticker2 else None
+        prices1 = self._fetch_stock_prices(ticker1) if ticker1 else []
+        prices2 = self._fetch_stock_prices(ticker2) if ticker2 else []
+        holders1 = self._holders_from_info(info1)
+        holders2 = self._holders_from_info(info2)
+
+        nexus1 = self._fetch_nexus_options(stock1.symbol) if stock1.is_fno and stock1.symbol else None
+        nexus2 = self._fetch_nexus_options(stock2.symbol) if stock2.is_fno and stock2.symbol else None
+        expiry1 = self._fetch_nexus_expiry_intel(stock1.symbol) if stock1.is_fno and stock1.symbol else None
+        expiry2 = self._fetch_nexus_expiry_intel(stock2.symbol) if stock2.is_fno and stock2.symbol else None
+
+        analysis1 = self._fetch_stock_analysis(ticker1) if ticker1 else None
+        analysis2 = self._fetch_stock_analysis(ticker2) if ticker2 else None
+
+        s1_sector = stock1.sector
+        s1_industry = stock1.industry
+        s2_sector = stock2.sector
+        s2_industry = stock2.industry
+        s1_market_cap = stock1.market_cap
+        s2_market_cap = stock2.market_cap
+        if info1:
+            s1_sector = s1_sector or info1.get("sector")
+            s1_industry = s1_industry or info1.get("industry")
+            s1_market_cap = s1_market_cap or _safe_float(info1.get("marketCap"))
+        else:
+            yf1 = self._yfinance_fallback(stock1.symbol)
+            if yf1:
+                s1_sector = s1_sector or yf1.get("sector")
+                s1_industry = s1_industry or yf1.get("industry")
+                s1_market_cap = s1_market_cap or yf1.get("market_cap")
+        if info2:
+            s2_sector = s2_sector or info2.get("sector")
+            s2_industry = s2_industry or info2.get("industry")
+            s2_market_cap = s2_market_cap or _safe_float(info2.get("marketCap"))
+        else:
+            yf2 = self._yfinance_fallback(stock2.symbol)
+            if yf2:
+                s2_sector = s2_sector or yf2.get("sector")
+                s2_industry = s2_industry or yf2.get("industry")
+                s2_market_cap = s2_market_cap or yf2.get("market_cap")
+
+        same_sector = bool(s1_sector and s2_sector and s1_sector == s2_sector)
+        same_industry = bool(s1_industry and s2_industry and s1_industry == s2_industry)
+        if same_industry:
+            ctype = "direct_peer"
+            summary_text = f"{stock1.company_name} and {stock2.company_name} are in the same industry — direct peer comparison."
+        elif same_sector:
+            ctype = "same_sector"
+            summary_text = f"{stock1.company_name} and {stock2.company_name} share the {s1_sector} sector."
+        else:
+            ctype = "cross_sector"
+            summary_text = f"{stock1.company_name} and {stock2.company_name} operate in different sectors."
+
+        return CoreComparison(
+            identity={
+                "stock1": {
+                    "symbol": stock1.symbol,
+                    "company_name": stock1.company_name,
+                    "slug": stock1.slug,
+                    "sector": s1_sector,
+                    "industry": s1_industry,
+                    "market_cap": s1_market_cap,
+                    "is_fno": stock1.is_fno,
+                },
+                "stock2": {
+                    "symbol": stock2.symbol,
+                    "company_name": stock2.company_name,
+                    "slug": stock2.slug,
+                    "sector": s2_sector,
+                    "industry": s2_industry,
+                    "market_cap": s2_market_cap,
+                    "is_fno": stock2.is_fno,
+                },
+                "same_sector": same_sector,
+                "same_industry": same_industry,
+                "comparison_type": ctype,
+            },
+            price_performance={
+                stock1.slug: self._calc_returns(prices1),
+                stock2.slug: self._calc_returns(prices2),
+            },
+            financials={
+                "stock1": self._pivot_from_financials(f1, "income_statement", self.FINANCIAL_LINE_ITEMS),
+                "stock2": self._pivot_from_financials(f2, "income_statement", self.FINANCIAL_LINE_ITEMS),
+                "comparison": self._compare_dicts(
+                    self._pivot_from_financials(f1, "income_statement", self.FINANCIAL_LINE_ITEMS),
+                    self._pivot_from_financials(f2, "income_statement", self.FINANCIAL_LINE_ITEMS),
+                ),
+            },
+            cash_flow={
+                "stock1": self._pivot_from_financials(f1, "cashflow", self.CASH_FLOW_ITEMS),
+                "stock2": self._pivot_from_financials(f2, "cashflow", self.CASH_FLOW_ITEMS),
+                "comparison": self._compare_dicts(
+                    self._pivot_from_financials(f1, "cashflow", self.CASH_FLOW_ITEMS),
+                    self._pivot_from_financials(f2, "cashflow", self.CASH_FLOW_ITEMS),
+                ),
+            },
+            valuation={
+                "stock1": self._extract_valuation(info1),
+                "stock2": self._extract_valuation(info2),
+                "comparison": self._compare_dicts(self._extract_valuation(info1), self._extract_valuation(info2)),
+            },
+            profitability={
+                "stock1": self._extract_profitability(info1),
+                "stock2": self._extract_profitability(info2),
+                "comparison": self._compare_dicts(self._extract_profitability(info1), self._extract_profitability(info2)),
+            },
+            growth={
+                "stock1": self._extract_growth(info1),
+                "stock2": self._extract_growth(info2),
+                "comparison": self._compare_dicts(self._extract_growth(info1), self._extract_growth(info2)),
+            },
+            holders={"stock1": holders1, "stock2": holders2},
+            fno={
+                "stock1": self._compute_fno_metrics(nexus1, expiry1) if stock1.is_fno else {"is_fno": False},
+                "stock2": self._compute_fno_metrics(nexus2, expiry2) if stock2.is_fno else {"is_fno": False},
+            },
+            analysis={"stock1": analysis1, "stock2": analysis2} if (analysis1 or analysis2) else None,
+            summary={"summary": summary_text, "comparison_type": ctype},
+        )
+
+    def _build_detail(self, stock1: StockIdentity, stock2: StockIdentity) -> DetailComparison | None:
+        ticker1 = self._exchange_ticker(stock1)
+        ticker2 = self._exchange_ticker(stock2)
+
+        f1 = self._fetch_financials_eav(ticker1) if ticker1 else {}
+        f2 = self._fetch_financials_eav(ticker2) if ticker2 else {}
+
+        balance_sheet = {
+            "stock1": self._pivot_from_financials(f1, "balance_sheet", self.BALANCE_SHEET_ITEMS),
+            "stock2": self._pivot_from_financials(f2, "balance_sheet", self.BALANCE_SHEET_ITEMS),
+        }
+
+        ins1 = self._fetch_insider(ticker1) if ticker1 else []
+        ins2 = self._fetch_insider(ticker2) if ticker2 else []
+
+        earn1 = self._fetch_earnings(ticker1) if ticker1 else []
+        earn2 = self._fetch_earnings(ticker2) if ticker2 else []
+
+        nexus1 = self._fetch_nexus_options(stock1.symbol) if stock1.is_fno and stock1.symbol else None
+        nexus2 = self._fetch_nexus_options(stock2.symbol) if stock2.is_fno and stock2.symbol else None
+
+        sd1 = []
+        sd2 = []
+        if nexus1:
+            sd = nexus1.get("strike_details", []) or []
+            if isinstance(sd, str):
+                try:
+                    import json
+                    sd = json.loads(sd)
+                except Exception:
+                    sd = []
+            sd1 = sd[:20]
+        if nexus2:
+            sd = nexus2.get("strike_details", []) or []
+            if isinstance(sd, str):
+                try:
+                    import json
+                    sd = json.loads(sd)
+                except Exception:
+                    sd = []
+            sd2 = sd[:20]
+
+        graph1 = self._fetch_entity_graph(stock1)
+        graph2 = self._fetch_entity_graph(stock2)
+        news1 = self._fetch_news(stock1)
+        news2 = self._fetch_news(stock2)
+        fii_dii = self._fetch_fii_dii()
+
+        return DetailComparison(
+            balance_sheet=balance_sheet,
+            insider_activity={"stock1": ins1, "stock2": ins2},
+            earnings={"stock1": earn1, "stock2": earn2},
+            options_detail={
+                "stock1": {"strike_details": sd1, "snapshot_time": _safe_datetime(nexus1.get("snapshot_timestamp"))} if nexus1 else {},
+                "stock2": {"strike_details": sd2, "snapshot_time": _safe_datetime(nexus2.get("snapshot_timestamp"))} if nexus2 else {},
+            },
+            entity_graph={"stock1": graph1, "stock2": graph2},
+            fii_dii_activity=fii_dii,
+            news={"stock1": news1, "stock2": news2},
+        )
+
+    def _compute_data_quality(self, core: CoreComparison, detail: DetailComparison | None) -> DataQuality:
+        available = []
+        warnings = []
+        if core.financials.get("stock1") or core.financials.get("stock2"):
+            available.append("financials")
+        else:
+            warnings.append("Financial data is not available for these stocks.")
+        if core.price_performance.get(list(core.price_performance.keys())[0]) if core.price_performance else None:
+            available.append("price_performance")
+        else:
+            warnings.append("Price history is not available.")
+        if detail and detail.earnings.get("stock1"):
+            available.append("earnings")
+        if detail and detail.insider_activity.get("stock1"):
+            available.append("insider_activity")
+        if core.fno.get("stock1", {}).get("is_fno") or core.fno.get("stock2", {}).get("is_fno"):
+            available.append("fno")
+        if core.valuation.get("stock1"):
+            available.append("valuation")
+        if core.holders.get("stock1"):
+            available.append("holders")
+        completeness = min(100, len(available) * 15)
+        status = "complete" if completeness >= 75 else "partial" if completeness >= 40 else "limited"
+        return DataQuality(
+            status=status,
+            completeness_score=completeness,
+            available_sections=available,
+            missing_sections=[],
+            stale_sections=[],
+            last_updated=None,
+            warnings=warnings,
+        )
+
+    def _seo_payload(self, stock1: StockIdentity, stock2: StockIdentity, canonical_path: str) -> dict[str, Any]:
+        return {
+            "title": f"{stock1.company_name} vs {stock2.company_name} — Financials, F&O, Valuation | ArinEdge",
+            "description": f"Compare {stock1.company_name} and {stock2.company_name} side-by-side: financials, cash flow, F&O metrics, valuation, profitability, and ownership data.",
+            "h1": f"{stock1.company_name} vs {stock2.company_name}",
+            "canonical_path": canonical_path,
+        }
+
+    def _related_links(self, stock1: StockIdentity, stock2: StockIdentity) -> list[RelatedLink]:
+        return [
+            RelatedLink(label=f"{stock1.company_name}", path=stock1.canonical_path),
+            RelatedLink(label=f"{stock2.company_name}", path=stock2.canonical_path),
+            RelatedLink(label=f"{stock1.company_name} Option Chain", path=f"/stocks/{stock1.slug}/option-chain", enabled=bool(stock1.is_fno)),
+            RelatedLink(label=f"{stock2.company_name} Option Chain", path=f"/stocks/{stock2.slug}/option-chain", enabled=bool(stock2.is_fno)),
+        ]
+
+    def _get_cached_comparison(self, comparison_slug: str) -> StockComparisonResponse | ComparisonErrorResponse | None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=COMPARE_CACHE_TTL_DAYS)
+        row = (
+            self.db.query(StockCompareCache)
+            .filter(StockCompareCache.comparison_slug == comparison_slug)
+            .first()
+        )
+        if not row:
+            return None
+        generated_at = row.generated_at
+        if generated_at is None or generated_at < cutoff:
+            return None
+        payload = row.response_payload or {}
+        if not payload:
+            return None
+        if payload.get("resolved") is False:
+            return ComparisonErrorResponse.model_validate(payload)
+        return StockComparisonResponse.model_validate(payload)
+
+    def _save_cached_comparison(
+        self,
+        comparison_slug: str,
+        stock1: StockIdentity,
+        stock2: StockIdentity,
+        response: StockComparisonResponse,
+    ) -> None:
+        try:
+            expires_at = datetime.now(timezone.utc) + timedelta(days=COMPARE_CACHE_TTL_DAYS)
+            payload = response.model_dump(mode="json")
+            existing = (
+                self.db.query(StockCompareCache)
+                .filter(StockCompareCache.comparison_slug == comparison_slug)
+                .first()
+            )
+            if existing:
+                existing.stock1_slug = stock1.slug
+                existing.stock2_slug = stock2.slug
+                existing.request_payload = response.request.model_dump(mode="json")
+                existing.response_payload = payload
+                existing.response_status = "success"
+                existing.generated_at = datetime.now(timezone.utc)
+                existing.expires_at = expires_at
+            else:
+                self.db.add(
+                    StockCompareCache(
+                        comparison_slug=comparison_slug,
+                        stock1_slug=stock1.slug,
+                        stock2_slug=stock2.slug,
+                        request_payload=response.request.model_dump(mode="json"),
+                        response_payload=payload,
+                        response_status="success",
+                        generated_at=datetime.now(timezone.utc),
+                        expires_at=expires_at,
+                    )
+                )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            logger.warning("Failed to persist stock compare cache for %s", comparison_slug, exc_info=True)
+
+    def compare_stocks(self, stock1_input: str, stock2_input: str) -> StockComparisonResponse | ComparisonErrorResponse:
+        logger.info("compare_stocks: %s vs %s", stock1_input, stock2_input)
+        stock1, s1_suggestions, s1_error = self.resolver.resolve_stock(stock1_input)
+        stock2, s2_suggestions, s2_error = self.resolver.resolve_stock(stock2_input)
+
+        request = ComparisonRequest(stock1_input=stock1_input, stock2_input=stock2_input)
+
+        if stock1 is None or stock2 is None:
+            errors: list[ComparisonErrorItem] = []
+            if stock1 is None:
+                errors.append(ComparisonErrorItem(side="stock1", input=stock1_input, reason=s1_error or "Not found"))
+            if stock2 is None:
+                errors.append(ComparisonErrorItem(side="stock2", input=stock2_input, reason=s2_error or "Not found"))
+            return ComparisonErrorResponse(
+                resolved=False, request=request, errors=errors,
+                suggestions={"stock1": s1_suggestions, "stock2": s2_suggestions},
+            )
+
+        if stock1.entity_id is not None and stock2.entity_id is not None and stock1.entity_id == stock2.entity_id:
+            return ComparisonErrorResponse(
+                resolved=False, request=request,
+                errors=[ComparisonErrorItem(side="stock1", input=stock1_input, reason="Both resolve to same stock")],
+            )
+
+        cache_slug = f"{stock1.slug}-vs-{stock2.slug}"
+        cached = self._get_cached_comparison(cache_slug)
+        if cached is not None:
+            return cached
+
+        canonical_path = f"/compare/{cache_slug}"
+        now_val = datetime.now(timezone.utc)
+
+        core = self._build_core(stock1, stock2)
+        stock1 = stock1.model_copy(update={
+            "sector": core.identity.get("stock1", {}).get("sector") or stock1.sector,
+            "industry": core.identity.get("stock1", {}).get("industry") or stock1.industry,
+            "market_cap": core.identity.get("stock1", {}).get("market_cap") or stock1.market_cap,
+        })
+        stock2 = stock2.model_copy(update={
+            "sector": core.identity.get("stock2", {}).get("sector") or stock2.sector,
+            "industry": core.identity.get("stock2", {}).get("industry") or stock2.industry,
+            "market_cap": core.identity.get("stock2", {}).get("market_cap") or stock2.market_cap,
+        })
+        detail = self._build_detail(stock1, stock2)
+        data_quality = self._compute_data_quality(core, detail)
+        expires_at = now_val + timedelta(days=COMPARE_CACHE_TTL_DAYS)
+
+        response = StockComparisonResponse(
+            resolved=True,
+            request=request,
+            canonical={"comparison_slug": cache_slug, "canonical_path": canonical_path},
+            stock1=stock1,
+            stock2=stock2,
+            seo=self._seo_payload(stock1, stock2, canonical_path),
+            core=core,
+            detail=detail,
+            data_quality=data_quality,
+            seo_eligibility=SeoEligibility(
+                indexable=True,
+                sitemap_eligible=True,
+                noindex_recommended=False,
+                reason="Sufficient comparison data available",
+                minimum_content_passed=True,
+            ),
+            related_links=self._related_links(stock1, stock2),
+            cached_at=_safe_datetime(now_val),
+            expires_at=_safe_datetime(expires_at),
+        )
+        self._save_cached_comparison(cache_slug, stock1, stock2, response)
+        return response
+
+
+class StockPriceService:
+    def __init__(self, db: Session):
+        self.compare = StockCompareService(db)
+
+
+class StockFinancialService:
+    def __init__(self, db: Session):
+        self.compare = StockCompareService(db)
+
+
+class StockEventService:
+    def __init__(self, db: Session):
+        self.compare = StockCompareService(db)
+
+
+class StockOptionsService:
+    def __init__(self, db: Session):
+        self.compare = StockCompareService(db)
+
+
+class StockPeerService:
+    def __init__(self, db: Session):
+        self.compare = StockCompareService(db)
+
+
+class SeoEligibilityService:
+    def __init__(self, db: Session):
+        self.compare = StockCompareService(db)

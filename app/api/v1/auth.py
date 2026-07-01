@@ -1,6 +1,6 @@
 import traceback
 
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request, Response
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -8,6 +8,7 @@ from app.schemas.user import (
     UserCreate,
     UserLogin,
     TokenResponse,
+    RefreshResponse,
     LoginResponse,
     MessageResponse,
     ForgotPasswordRequest,
@@ -15,11 +16,11 @@ from app.schemas.user import (
     EmailVerifyRequest,
     UserResponse,
 )
-from app.services.auth import AuthService
+from app.services.auth import AuthService, _set_refresh_cookie, _clear_refresh_cookie
 from app.dependencies.auth import get_current_user, get_current_active_verified_user
 from app.models.user import User
-from app.utils.security import create_access_token
 from app.utils.logger import get_logger
+from app.utils.rate_limiter import check_rate_limit
 
 router = APIRouter()
 logger = get_logger(__name__)
@@ -34,7 +35,13 @@ def signup(
     data: UserCreate,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
+    try:
+        check_rate_limit(request, "signup", max_attempts=5, window_minutes=60)
+    except HTTPException:
+        raise
+
     try:
         user = AuthService.register_user(db, data)
     except ValueError as e:
@@ -66,16 +73,28 @@ def _send_verification_email_wrapper(email: str, full_name: str, token: str):
 
 
 @router.post("/login", response_model=LoginResponse)
-def login(data: UserLogin, db: Session = Depends(get_db)):
+def login(
+    data: UserLogin,
+    response: Response,
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
     try:
-        user = AuthService.authenticate_user(db, data.email, data.password)
-        if not user:
+        check_rate_limit(request, "login", key_suffix=data.email, max_attempts=5, window_minutes=15)
+    except HTTPException:
+        raise
+
+    try:
+        result = AuthService.authenticate_user(db, data.email, data.password, request)
+        if not result:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password",
             )
 
-        access_token = create_access_token(user.id)
+        user, access_token, refresh_token = result
+        _set_refresh_cookie(response, refresh_token)
+
         logger.info("Login successful for user id=%s (verified=%s)", user.id, user.is_email_verified)
         return LoginResponse(access_token=access_token, user=user, email_verified=user.is_email_verified)
     except HTTPException:
@@ -83,6 +102,39 @@ def login(data: UserLogin, db: Session = Depends(get_db)):
     except Exception:
         logger.error("Login failed unexpectedly for %s:\n%s", data.email, traceback.format_exc())
         raise HTTPException(status_code=500, detail="Login failed due to an internal error")
+
+
+@router.post("/refresh", response_model=RefreshResponse)
+def refresh_token(
+    response: Response,
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
+    raw_refresh_token = request.cookies.get("refresh_token") if request else None
+    if not raw_refresh_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No refresh token provided",
+        )
+
+    try:
+        result = AuthService.refresh_session(db, raw_refresh_token, request)
+        if not result:
+            _clear_refresh_cookie(response)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired refresh token",
+            )
+
+        user, access_token, new_refresh_token = result
+        _set_refresh_cookie(response, new_refresh_token)
+
+        return RefreshResponse(access_token=access_token)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.error("Refresh failed unexpectedly:\n%s", traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Token refresh failed due to an internal error")
 
 
 @router.get("/me", response_model=UserResponse)
@@ -94,14 +146,29 @@ def get_current_user_profile(
 
 @router.post("/logout", response_model=MessageResponse)
 def logout(
+    response: Response,
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
+    raw_refresh_token = request.cookies.get("refresh_token") if request else None
+    AuthService.logout_session(db, raw_refresh_token, request)
+    _clear_refresh_cookie(response)
+    return MessageResponse(message="Logged out successfully.")
+
+
+@router.post("/logout-all", response_model=MessageResponse)
+def logout_all(
+    response: Response,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
     try:
-        AuthService.logout_user(db, current_user)
-        return MessageResponse(message="Logged out successfully.")
+        AuthService.logout_all_sessions(db, current_user.id, request)
+        _clear_refresh_cookie(response)
+        return MessageResponse(message="Logged out from all sessions successfully.")
     except Exception:
-        logger.error("Logout failed:\n%s", traceback.format_exc())
+        logger.error("Logout-all failed:\n%s", traceback.format_exc())
         raise HTTPException(status_code=500, detail="Logout failed due to an internal error")
 
 
@@ -165,8 +232,15 @@ def resend_verification(
 
 @router.post("/forgot-password", response_model=MessageResponse)
 def forgot_password(
-    data: ForgotPasswordRequest, db: Session = Depends(get_db)
+    data: ForgotPasswordRequest,
+    db: Session = Depends(get_db),
+    request: Request = None,
 ):
+    try:
+        check_rate_limit(request, "forgot-password", key_suffix=data.email, max_attempts=3, window_minutes=60)
+    except HTTPException:
+        raise
+
     try:
         AuthService.initiate_password_reset(db, data.email)
         return MessageResponse(
@@ -178,9 +252,13 @@ def forgot_password(
 
 
 @router.post("/reset-password", response_model=MessageResponse)
-def reset_password(data: ResetPasswordRequest, db: Session = Depends(get_db)):
+def reset_password(
+    data: ResetPasswordRequest,
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
     try:
-        success = AuthService.reset_password(db, data.token, data.new_password)
+        success = AuthService.reset_password(db, data.token, data.new_password, request)
         if not success:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
